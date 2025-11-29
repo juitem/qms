@@ -1,6 +1,6 @@
-# QMS(Quick Multi Symbolizer)
+# QMS (Quick Multi Symmbolizer)
 
-`quick_asan_symbolizer.py` is a fast, parallel ASan/Crash log symbolizer for ELF binaries.
+`quick_multi_symbolizer.py` is a fast, parallel ASan/Crash log symbolizer for ELF binaries.
 
 It parses stack traces that contain entries like:
 
@@ -68,7 +68,48 @@ and rewrites them into a more readable form using `addr2line` / `llvm-addr2line`
   - Each line contains:
     - `orig_elf`, `offset`, `build_id`, `resolved_target_elf`, `reason`.
 
+
 ---
+## Flowchart
+```mermaid
+flowchart TD
+  A[Scan logs under input dir] --> B[Parse stack frames and collect origin and offset and build id]
+  B --> C[Load cached symbols from SQLite optional]
+  C --> D[Filter out already cached origin and offset]
+  D --> E[Resolve target ELF paths using rootfs debuglink build id and Yocto style]
+  E --> F[Group offsets by target ELF]
+  F --> G[Run addr2line or llvm addr2line per ELF using stdin]
+  G --> H[Collect func and file line results and build in memory cache]
+  H --> I[Persist new results to SQLite optional]
+  H --> J[Rewrite log files under output dir]
+  J --> K[Write failed symbolization tsv for failures]
+```
+
+## Symbolization sequence (per address)
+```mermaid
+sequenceDiagram
+  participant L as Log line
+  participant P as Parser
+  participant C as Cache (SQLite)
+  participant R as Resolver
+  participant A as addr2line
+  participant W as Writer
+
+  L->>P: stack frame with (/path/lib.so+0xOFFSET)
+  P->>C: lookup (orig_elf, offset)
+  alt cache hit
+    C-->>P: func + file:line
+  else cache miss
+    P->>R: resolve target ELF (rootfs, debuglink, build-id)
+    R->>A: send OFFSET via stdin
+    A-->>R: func + file:line
+    R->>C: store (orig_elf, offset) in cache
+    R-->>P: func + file:line
+  end
+  P->>W: rewrite line with symbolized info
+```
+---
+
 
 ## Requirements
 
@@ -90,7 +131,7 @@ You can run the script directly. For example:
 ```bash
 git clone &lt;your-repo-url&gt; quick_symbolizer
 cd quick_symbolizer
-python3 quick_asan_symbolizer.py -h
+python3 quick_multi_symbolizer.py -h
 ```
 
 ---
@@ -176,7 +217,7 @@ In short, the pipeline works as follows:
 ### 1. LLVM mode (default)
 
 ```bash
-python quick_asan_symbolizer.py \
+python quick_multi_symbolizer.py \
   --input-dir ./logs_raw \
   --output-dir ./logs_sym \
   --rootfs /mnt/tizen-rootfs \
@@ -193,7 +234,7 @@ python quick_asan_symbolizer.py \
 ### 2. GNU mode + Tizen build-id + ARM cross toolchain
 
 ```bash
-python quick_asan_symbolizer.py \
+python quick_multi_symbolizer.py \
   --input-dir ./logs_raw \
   --output-dir ./logs_sym \
   --rootfs /mnt/tizen-rootfs \
@@ -218,7 +259,7 @@ python quick_asan_symbolizer.py \
 ### 3. One-shot symbolization without cache
 
 ```bash
-python quick_asan_symbolizer.py \
+python quick_multi_symbolizer.py \
   --input-dir ./logs_raw \
   --output-dir ./logs_sym \
   --rootfs /mnt/tizen-rootfs \
@@ -258,6 +299,13 @@ python quick_asan_symbolizer.py \
 
 - **ELF-level symbolization**
   - For multiple offsets in the same ELF, only one addr2line process is spawned and all addresses are streamed to it via stdin, significantly reducing process creation overhead.
+
+- **Batch addr2line via stdin (multi-address streaming)**
+  - For each ELF, the script launches only **one** `addr2line`/`llvm-addr2line` process.
+  - All offsets belonging to that ELF are streamed through **stdin**, one per line, instead of being passed as command-line arguments.
+  - This avoids OS-level argument length limits (ARG_MAX) and keeps process creation overhead very low.
+  - If any single offset fails to resolve, `addr2line` returns `??` for that entry but continues processing the remaining offsets without terminating.
+  - This makes symbolization efficient and robust even when a single ELF has tens of thousands of addresses.
 
 - **Delta cache**
   - SQLite table schema:
