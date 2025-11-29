@@ -1,0 +1,177 @@
+name: Build QMS (Linux 22/24 x86+arm, macOS Universal, Windows)
+
+on:
+  push:
+    branches: [ main ]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# -------------------------------------------------------
+# 1) Linux: Ubuntu 22.04 / 24.04, amd64 / arm64 (Docker)
+# -------------------------------------------------------
+jobs:
+  linux:
+    name: Linux ${{ matrix.os_version }} (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os_version: ["22.04", "24.04"]
+        arch: ["amd64", "arm64"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for arm64
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
+      - name: Build with PyInstaller in Ubuntu ${{ matrix.os_version }} (${{
+          matrix.arch }})
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            --platform=linux/${{ matrix.arch }} \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            ubuntu:${{ matrix.os_version }} \
+            bash -lc "
+              set -euo pipefail;
+              apt-get update;
+              DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv;
+              python3 -m pip install --upgrade pip;
+              python3 -m pip install pyinstaller;
+              pyinstaller quick_multi_symbolizer.py --onefile --name qms_linux_${{ matrix.os_version }}_${{ matrix.arch }};
+              ls -R dist
+            "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qms-linux-${{ matrix.os_version }}-${{ matrix.arch }}
+          path: dist/qms_linux_${{ matrix.os_version }}_${{ matrix.arch }}
+
+# -------------------------------------------------------
+# 2) macOS: x86_64 + arm64 + Universal
+# -------------------------------------------------------
+  macos-intel:
+    name: macOS Intel (x86_64)
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (Intel)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build macOS x86_64 binary
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          pyinstaller quick_multi_symbolizer.py --onefile --name qms_macos_x86_64
+          ls -R dist
+
+      - name: Upload macOS x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qms-macos-x86_64
+          path: dist/qms_macos_x86_64
+
+  macos-arm:
+    name: macOS Apple Silicon (arm64)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (ARM64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build macOS arm64 binary
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          pyinstaller quick_multi_symbolizer.py --onefile --name qms_macos_arm64
+          ls -R dist
+
+      - name: Upload macOS arm64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qms-macos-arm64
+          path: dist/qms_macos_arm64
+
+  macos-universal:
+    name: macOS Universal (x86_64 + arm64)
+    runs-on: macos-latest
+    needs:
+      - macos-intel
+    # arm64 빌드도 필요하면 주석 해제
+    #  - macos-arm
+
+    steps:
+      - name: Download macOS x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qms-macos-x86_64
+          path: artifacts/x86_64
+
+      - name: Download macOS arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qms-macos-arm64
+          path: artifacts/arm64
+
+      - name: Create Universal binary with lipo
+        run: |
+          ls -R artifacts
+          lipo -create \
+            artifacts/x86_64/qms_macos_x86_64 \
+            artifacts/arm64/qms_macos_arm64 \
+            -output qms_macos_universal
+          lipo -info qms_macos_universal
+
+      - name: Upload macOS Universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qms-macos-universal
+          path: qms_macos_universal
+
+# -------------------------------------------------------
+# 3) Windows
+# -------------------------------------------------------
+  windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build Windows exe
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          pyinstaller quick_multi_symbolizer.py --onefile --name qms_windows.exe
+          dir dist
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qms-windows
+          path: dist/qms_windows.exe
