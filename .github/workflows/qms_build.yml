@@ -30,8 +30,7 @@ jobs:
         with:
           platforms: linux/arm64
 
-      - name: Build with PyInstaller in Ubuntu ${{ matrix.os_version }} (${{
-          matrix.arch }})
+      - name: Build with PyInstaller in Ubuntu ${{ matrix.os_version }} (${{ matrix.arch }})
         run: |
           set -euo pipefail
 
@@ -44,8 +43,10 @@ jobs:
               set -euo pipefail;
               apt-get update;
               DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv;
-              python3 -m pip install --upgrade pip;
-              python3 -m pip install pyinstaller;
+              python3 -m venv .venv;
+              . .venv/bin/activate;
+              pip install --upgrade pip;
+              pip install pyinstaller;
               pyinstaller quick_multi_symbolizer.py --onefile --name qms_linux_${{ matrix.os_version }}_${{ matrix.arch }};
               ls -R dist
             "
