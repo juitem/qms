@@ -83,23 +83,18 @@ and rewrites them into a more readable form using `addr2line` / `llvm-addr2line`
 ## Flowchart
 ```mermaid
 flowchart TD
-  A Scan logs under input dir --> B Parse stack frames and collect (orig_elf offset build-id)
-
-  B --> C1{cache-db given?}
-  C1 -->|no| D[Use empty RAM cache (no persistent cache)]
+  A[Scan logs under input dir] --> B[Parse stack frames and collect origin offset build id]
+  B --> C1{cache db given}
+  C1 -->|no| D[Use empty RAM cache]
   C1 -->|yes| C2[Load cached symbols from SQLite] --> D[Build working RAM cache]
-
-  D --> E[Resolve target ELF: rootfs, debuglink, build-id, Yocto-style]
+  D --> E[Resolve target ELF using rootfs debuglink build id Yocto style]
   E --> F[Group offsets by target ELF]
-
-  F --> G[Run addr2line/llvm-addr2line per ELF using stdin]
-  G --> H[Collect func + file:line results → build RAM symbol cache]
-
-  H --> H1{cache-db given?}
+  F --> G[Run addr2line or llvm addr2line per ELF using stdin]
+  G --> H[Collect function and file line results and build RAM symbol cache]
+  H --> H1{cache db given}
   H1 -->|no| J[Rewrite files using RAM cache]
   H1 -->|yes| I[Persist new results to SQLite] --> J[Rewrite files]
-
-  J --> K[Write failed symbolization TSV]
+  J --> K[Write failed symbolization tsv]
 ```
 
 ## Symbolization sequence (per address)
