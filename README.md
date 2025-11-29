@@ -68,6 +68,16 @@ and rewrites them into a more readable form using `addr2line` / `llvm-addr2line`
   - Each line contains:
     - `orig_elf`, `offset`, `build_id`, `resolved_target_elf`, `reason`.
 
+- **Benchmark mode**
+  - With `--benchmark`, QMS prints timing information for each major phase:
+    - origin scan
+    - cache load
+    - ELF job construction
+    - symbolization
+    - cache save
+    - file rewrite
+    - total execution time
+  - Benchmark mode is disabled by default and has negligible overhead when enabled.
 
 ---
 ## Flowchart
@@ -75,13 +85,17 @@ and rewrites them into a more readable form using `addr2line` / `llvm-addr2line`
 flowchart TD
   A[Scan logs under input dir] --> B[Parse stack frames and collect origin and offset and build id]
   B --> C[Load cached symbols from SQLite optional]
-  C --> D[Filter out already cached origin and offset]
+  C --> C1{cache-db given?}
+  C1 -->|no| D[Use in-memory cache only]
+  C1 -->|yes| C2[Load cached symbols from SQLite] --> D[Merge with in-memory]
   D --> E[Resolve target ELF paths using rootfs debuglink build id and Yocto style]
   E --> F[Group offsets by target ELF]
   F --> G[Run addr2line or llvm addr2line per ELF using stdin]
   G --> H[Collect func and file line results and build in memory cache]
   H --> I[Persist new results to SQLite optional]
-  H --> J[Rewrite log files under output dir]
+  H --> H1{cache-db given?}
+  H1 -->|no| J[Rewrite files...]
+  H1 -->|yes| I[Persist new results to SQLite] --> J[Rewrite files...]
   J --> K[Write failed symbolization tsv for failures]
 ```
 
@@ -110,7 +124,6 @@ sequenceDiagram
 ```
 ---
 
-g
 ## Requirements
 
 - Python 3.8+
@@ -129,7 +142,7 @@ g
 You can run the script directly. For example:
 
 ```bash
-git clone &lt;your-repo-url&gt; quick_symbolizer
+git clone <your-repo-url>; cd quick_symbolizer
 cd quick_symbolizer
 python3 quick_multi_symbolizer.py -h
 ```
@@ -270,6 +283,29 @@ python quick_multi_symbolizer.py \
 - Every run symbolizes all addresses from scratch.
 - Without `--debug-root`, build-id debug files are looked up under `<rootfs>/.build-id` by default.
 
+### 4. Benchmark mode
+
+```bash
+python quick_multi_symbolizer.py \
+  --input-dir ./logs_raw \
+  --output-dir ./logs_sym \
+  --rootfs /mnt/tizen-rootfs \
+  --benchmark
+```
+
+Example output:
+
+```
+[BENCH] collect_origins: 0.123s
+[BENCH] load_cache_from_db: 0.015s
+[BENCH] build_jobs_by_target: 0.041s
+[BENCH] symbolize_all_parallel: 0.812s
+[BENCH] build_symbol_cache: 0.009s
+[BENCH] rewrite_files: 0.067s
+[BENCH] save_failures: 0.002s
+[BENCH] total_time: 1.119s
+```
+
 ---
 
 ## Command-line options
@@ -286,6 +322,7 @@ python quick_multi_symbolizer.py \
 | `-c, --cross-prefix` | string | empty | Cross prefix for GNU toolchain, e.g. `arm-linux-gnueabihf-`. |
 | `--cache-db` | path | empty | SQLite DB path for delta symbolization. If empty, persistent cache is disabled. |
 | `-d, --demangle` | flag | off | Enable C++ name demangling (`-C` flag to addr2line). |
+| `--benchmark` | flag | off | Print timing information for each major pipeline phase. |
 | `-gnu` | flag | off | Use GNU addr2line mode. |
 | `-llvm` | flag | default | Use llvm-addr2line mode (default). |
 

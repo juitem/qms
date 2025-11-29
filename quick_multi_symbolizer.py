@@ -50,6 +50,7 @@ import os
 import re
 import sqlite3
 import subprocess
+from time import perf_counter
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -672,6 +673,11 @@ def main():
         action="store_true",
         help="Demangle C++ names (pass -C to addr2line). Default: off.",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Print timing information for major phases. Default: off.",
+    )
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -691,6 +697,7 @@ def main():
 
     args = parser.parse_args()
     mode = args.mode or "llvm"
+    benchmark = args.benchmark
 
     # Determine addr2line binary
     if args.addr2line:
@@ -741,11 +748,19 @@ def main():
         print(f"[INFO] cache_db disabled (no persistent cache)")
     print(f"[INFO] workers_symbol={workers_symbol}, workers_rewrite={workers_rewrite}")
 
+    # Benchmark timers
+    t_start = perf_counter()
+    t_prev = t_start
+
     # 1) origins
     print("[INFO] Collecting origins...")
     origins_full, all_files = collect_origins(input_dir)
     print(f"[INFO] {len(origins_full)} unique ELF/offset pairs")
     print(f"[INFO] {len(all_files)} files will be rewritten")
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] collect_origins: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 2) SQLite delta cache (optional)
     conn: Optional[sqlite3.Connection] = None
@@ -757,6 +772,10 @@ def main():
         print("[INFO] Loading cache from SQLite...")
         origins, cache_from_db = load_cache_for_origins(conn, origins_full)
         print(f"[INFO] Cache hits={len(cache_from_db)}, remaining to symbolize={len(origins)}")
+        if benchmark:
+            t_now = perf_counter()
+            print(f"[BENCH] load_cache_from_db: {t_now - t_prev:.3f}s")
+            t_prev = t_now
     else:
         origins = origins_full
 
@@ -766,6 +785,10 @@ def main():
         origins, mode, debug_root, rootfs
     )
     print(f"[INFO] {len(jobs_by_target)} target ELFs")
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] build_jobs_by_target: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 4) parallel symbolize
     print("[INFO] Symbolizing...")
@@ -773,11 +796,19 @@ def main():
         jobs_by_target, addr2line_bin, workers_symbol, args.demangle
     )
     print(f"[INFO] Newly symbolized={len(target_results)}, fails={len(fail_list)}")
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] symbolize_all_parallel: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 5) build in-memory symbol cache for newly symbolized subset
     print("[INFO] Building symbol cache (new results)...")
     cache_new = build_symbol_cache(origins, target_for_origin, target_results)
     print(f"[INFO] New cache entries={len(cache_new)}")
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] build_symbol_cache: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 6) store new cache entries into SQLite (delta)
     if conn is not None:
@@ -785,6 +816,10 @@ def main():
         save_new_cache_entries(conn, cache_new)
         conn.commit()
         conn.close()
+        if benchmark:
+            t_now = perf_counter()
+            print(f"[BENCH] save_cache_to_db: {t_now - t_prev:.3f}s")
+            t_prev = t_now
 
     # 7) final cache = DB hits + new
     cache: Dict[Tuple[str, str], Tuple[str, str]] = {}
@@ -796,10 +831,19 @@ def main():
     print("[INFO] Rewriting files...")
     os.makedirs(output_dir, exist_ok=True)
     rewrite_files_parallel(all_files, input_dir, output_dir, cache, workers_rewrite)
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] rewrite_files: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 9) failure log (only for newly symbolized attempts)
     print("[INFO] Saving failure report...")
     save_failures(output_dir, fail_list, origins, target_for_origin, debug_missing)
+
+    if benchmark:
+        t_end = perf_counter()
+        print(f"[BENCH] save_failures: {t_end - t_prev:.3f}s")
+        print(f"[BENCH] total_time: {t_end - t_start:.3f}s")
 
     print("[INFO] Done.")
 
