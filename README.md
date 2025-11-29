@@ -35,6 +35,9 @@ and rewrites them into a more readable form using `addr2line` / `llvm-addr2line`
   - Each can be tuned independently:
     - `--workers-symbol N`
     - `--workers-rewrite M`
+  - Auto modes:
+    - `--workers-symbol auto` → auto = min(CPU_count, AvailableRAM / 300MB)
+    - `--workers-rewrite auto` → auto = max(4, CPU_count)
 
 - **GNU cross toolchain support**
   - With `-gnu -c arm-linux-gnueabihf-`, the script uses:
@@ -281,6 +284,17 @@ python quick_multi_symbolizer.py \
 - Every run symbolizes all addresses from scratch.
 - Without `--debug-root`, build-id debug files are looked up under `<rootfs>/.build-id` by default.
 
+### 5. Auto parallelism example
+
+```bash
+python quick_multi_symbolizer.py \
+  --input-dir ./logs_raw \
+  --output-dir ./logs_sym \
+  --rootfs /mnt/tizen-rootfs \
+  --workers-symbol auto \
+  --workers-rewrite auto
+```
+
 ### 4. Benchmark mode
 
 ```bash
@@ -309,14 +323,14 @@ Example output:
 ## Command-line options
 
 | Option | Type | Default | Description |
-|--------|------|---------|-------------|
+|---------------------------|------|---------|-------------|
 | `--input-dir` | path | (required) | Root directory of raw log files to read. |
 | `--output-dir` | path | (required) | Output directory to store symbolized logs. |
 | `--addr2line` | path | auto | Explicit addr2line binary. If not set, uses `llvm-addr2line` for `-llvm`, or `[cross-prefix]addr2line` for `-gnu`. |
 | `--debug-root` | path | empty (=> `.build-id` under rootfs) | Base directory for build-id debug files (GNU mode only). If empty, the tool assumes a `.build-id` directory located under the given rootfs and resolves build-id paths relative to it. |
 | `--rootfs` | path | empty | Rootfs prefix for resolving ELF paths from logs. |
-| `--workers-symbol` | int | CPU count | Process workers for symbolization. |
-| `--workers-rewrite` | int | 2×CPU | Thread workers for file rewriting. |
+| `--workers-symbol` | int/auto | 1 | Symbolization workers. `"auto"` or `0` → auto = min(CPU_count, AvailableRAM / 300MB); `1` → no parallelism; `N>1` → use N workers. |
+| `--workers-rewrite` | int/auto | 1 | File rewrite workers. `"auto"` or `0` → auto = max(4, CPU_count); `1` → no parallelism; `N>1` → use N workers. |
 | `-c, --cross-prefix` | string | empty | Cross prefix for GNU toolchain, e.g. `arm-linux-gnueabihf-`. |
 | `--cache-db` | path | empty | SQLite DB path for delta symbolization. If empty, persistent cache is disabled. |
 | `-d, --demangle` | flag | off | Enable C++ name demangling (`-C` flag to addr2line). |

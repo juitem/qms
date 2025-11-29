@@ -57,7 +57,34 @@ from functools import lru_cache
 
 # Module-level variable for readelf binary
 READ_ELF_BIN = "readelf"
+
 from typing import Dict, List, Tuple, Set, Optional
+
+# ------------------------------------------------------------
+# System helpers
+# ------------------------------------------------------------
+
+def get_available_memory_bytes() -> Optional[int]:
+    """
+    Try to read available memory from /proc/meminfo (Linux).
+    Returns:
+      available bytes, or None if not available.
+    """
+    meminfo_path = "/proc/meminfo"
+    if not os.path.exists(meminfo_path):
+        return None
+    try:
+        with open(meminfo_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        # value is in kB
+                        kb = int(parts[1])
+                        return kb * 1024
+    except Exception:
+        return None
+    return None
 
 # ------------------------------------------------------------
 # Regex patterns
@@ -405,9 +432,12 @@ def _symbolize_one_elf(args):
     return target_elf, results, fails
 
 
-def symbolize_all_parallel(jobs_by_target, addr2line_bin, workers_symbol, demangle):
+def symbolize_all_parallel(jobs_by_target, addr2line_bin, workers_symbol, demangle, progress=False):
     """
     Run symbolization in parallel per ELF.
+
+    If progress is True, prints per-ELF progress as:
+      [PROGRESS] ELF N/M (XX.X%)
     """
     target_results: Dict[Tuple[str, str], Tuple[str, str]] = {}
     fail_list: List[Tuple[str, str, str]] = []
@@ -415,14 +445,24 @@ def symbolize_all_parallel(jobs_by_target, addr2line_bin, workers_symbol, demang
     if not jobs_by_target:
         return target_results, fail_list
 
+    total = len(jobs_by_target)
+    completed = 0
+
+    # Single-process mode (no ProcessPool)
     if workers_symbol <= 1:
         for t_elf, offsets in jobs_by_target.items():
             _, res, fails = _symbolize_one_elf((t_elf, offsets, addr2line_bin, demangle))
             for off, info in res.items():
                 target_results[(t_elf, off)] = info
             fail_list.extend(fails)
+
+            completed += 1
+            if progress:
+                pct = (completed * 100.0) / total
+                print(f"[PROGRESS] ELF {completed}/{total} ({pct:.1f}%)")
         return target_results, fail_list
 
+    # Parallel mode using ProcessPoolExecutor
     tasks = [(t_elf, offsets, addr2line_bin, demangle) for t_elf, offsets in jobs_by_target.items()]
 
     with ProcessPoolExecutor(max_workers=workers_symbol) as ex:
@@ -433,8 +473,12 @@ def symbolize_all_parallel(jobs_by_target, addr2line_bin, workers_symbol, demang
                 target_results[(t_elf, off)] = info
             fail_list.extend(fails)
 
-    return target_results, fail_list
+            completed += 1
+            if progress:
+                pct = (completed * 100.0) / total
+                print(f"[PROGRESS] ELF {completed}/{total} ({pct:.1f}%)")
 
+    return target_results, fail_list
 
 # ------------------------------------------------------------
 # 4) Build in-memory symbol cache
@@ -483,22 +527,37 @@ def _rewrite_one_file(args):
         print(f"[WARN] rewrite failed for {src_path}: {e}")
 
 
-def rewrite_files_parallel(all_files, input_dir, output_dir, cache, workers_rewrite):
+def rewrite_files_parallel(all_files, input_dir, output_dir, cache, workers_rewrite, progress=False):
     if not all_files:
         return
 
+    total_files = len(all_files)
+
+    # Single-threaded rewrite
     if workers_rewrite <= 1:
-        for src in all_files:
+        for idx, src in enumerate(all_files, 1):
             _rewrite_one_file((src, input_dir, output_dir, cache))
+            if progress:
+                pct = (idx * 100.0) / total_files
+                print(f"\r[PROGRESS] files {idx}/{total_files} ({pct:.1f}%)", end="", flush=True)
+        if progress:
+            print()  # newline after finishing
         return
 
+    # Parallel rewrite using ThreadPoolExecutor
     tasks = [(src, input_dir, output_dir, cache) for src in all_files]
-    max_workers = min(workers_rewrite, len(all_files))
+    max_workers = min(workers_rewrite, total_files)
+    completed = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(_rewrite_one_file, t) for t in tasks]
         for _ in as_completed(futures):
-            pass
+            completed += 1
+            if progress:
+                pct = (completed * 100.0) / total_files
+                print(f"\r[PROGRESS] files {completed}/{total_files} ({pct:.1f}%)", end="", flush=True)
+    if progress:
+        print()  # newline after finishing
 
 
 # ------------------------------------------------------------
@@ -642,17 +701,25 @@ def main():
     )
     parser.add_argument(
         "--workers-symbol",
-        type=int,
-        default=0,
-        help="ProcessPool worker count for symbolization. "
-             "0 or <=0 => CPU count.",
+        type=str,
+        default="1",
+        help=(
+            "ProcessPool worker count for symbolization. "
+            "'auto' or 0 => auto (based on CPU and available memory), "
+            "1 => no parallelism (single process), "
+            "N>1 => use N workers. Default: 1."
+        ),
     )
     parser.add_argument(
         "--workers-rewrite",
-        type=int,
-        default=0,
-        help="ThreadPool worker count for file rewrite. "
-             "0 or <=0 => 2×CPU count.",
+        type=str,
+        default="1",
+        help=(
+            "ThreadPool worker count for file rewrite. "
+            "'auto' or 0 => auto (max(4, CPU count)), "
+            "1 => no parallelism (single thread), "
+            "N>1 => use N workers. Default: 1."
+        ),
     )
     parser.add_argument(
         "-c",
@@ -678,6 +745,11 @@ def main():
         action="store_true",
         help="Print timing information for major phases. Default: off.",
     )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print per-ELF symbolization progress as N/M (percentage). Default: off.",
+    )
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -698,6 +770,21 @@ def main():
     args = parser.parse_args()
     mode = args.mode or "llvm"
     benchmark = args.benchmark
+
+    # Normalize worker options: accept "auto" (case-insensitive) or integers.
+    def _normalize_workers(name: str, value):
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v == "auto":
+                return 0
+            try:
+                return int(value)
+            except ValueError:
+                parser.error(f"--{name} must be an integer or 'auto', got: {value!r}")
+        return value
+
+    args.workers_symbol = _normalize_workers("workers-symbol", args.workers_symbol)
+    args.workers_rewrite = _normalize_workers("workers-rewrite", args.workers_rewrite)
 
     # Determine addr2line binary
     if args.addr2line:
@@ -732,8 +819,32 @@ def main():
     except Exception:
         cpu_count = 4
 
-    workers_symbol = args.workers_symbol if args.workers_symbol > 0 else cpu_count
-    workers_rewrite = args.workers_rewrite if args.workers_rewrite > 0 else max(2, cpu_count * 2)
+    # Symbol workers:
+    #   If user specifies --workers-symbol:
+    #     0 => auto (based on CPU and available memory)
+    #     1 => no parallelism (single process)
+    #     N>1 => use N workers
+    #   If not specified, default is 1 (no parallelism).
+    if args.workers_symbol == 0:
+        available = get_available_memory_bytes()
+        if available is not None:
+            mem_workers = max(1, available // (300 * 1024 * 1024))
+            workers_symbol = max(1, min(cpu_count, mem_workers))
+        else:
+            workers_symbol = cpu_count
+    else:
+        workers_symbol = args.workers_symbol
+
+    # Rewrite workers:
+    #   If user specifies --workers-rewrite:
+    #     0 => auto (max(4, cpu_count))
+    #     1 => no parallelism (single thread)
+    #     N>1 => use N workers
+    #   If not specified, default is 1 (no parallelism).
+    if args.workers_rewrite == 0:
+        workers_rewrite = max(4, cpu_count)
+    else:
+        workers_rewrite = args.workers_rewrite
 
     print(f"[INFO] mode={mode}, addr2line={addr2line_bin}")
     print(f"[INFO] input_dir={input_dir}")
@@ -793,7 +904,7 @@ def main():
     # 4) parallel symbolize
     print("[INFO] Symbolizing...")
     target_results, fail_list = symbolize_all_parallel(
-        jobs_by_target, addr2line_bin, workers_symbol, args.demangle
+        jobs_by_target, addr2line_bin, workers_symbol, args.demangle, args.progress
     )
     print(f"[INFO] Newly symbolized={len(target_results)}, fails={len(fail_list)}")
     if benchmark:
@@ -830,7 +941,7 @@ def main():
     # 8) rewrite
     print("[INFO] Rewriting files...")
     os.makedirs(output_dir, exist_ok=True)
-    rewrite_files_parallel(all_files, input_dir, output_dir, cache, workers_rewrite)
+    rewrite_files_parallel(all_files, input_dir, output_dir, cache, workers_rewrite, args.progress)
     if benchmark:
         t_now = perf_counter()
         print(f"[BENCH] rewrite_files: {t_now - t_prev:.3f}s")
