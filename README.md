@@ -1,4 +1,4 @@
-# QMS (Quick Multi Symmbolizer)
+# QMS (Quick Multi Symbolizer)
 
 `quick_multi_symbolizer.py` is a fast, parallel ASan/Crash log symbolizer for ELF binaries.
 
@@ -88,7 +88,7 @@ flowchart TD
   C --> C1{cache-db given?}
   C1 -->|no| D[Use in-memory cache only]
   C1 -->|yes| C2[Load cached symbols from SQLite] --> D[Merge with in-memory]
-  D --> E[Resolve target ELF paths using rootfs debuglink build id and Yocto style]
+  D --> E[Resolve target ELF: rootfs, debuglink, build-id, Yocto-style]
   E --> F[Group offsets by target ELF]
   F --> G[Run addr2line or llvm addr2line per ELF using stdin]
   G --> H[Collect func and file line results and build in memory cache]
@@ -104,7 +104,7 @@ flowchart TD
 sequenceDiagram
   participant L as Log line
   participant P as Parser
-  participant C as Cache (SQLite)
+  participant C as Cache (RAM or SQLite)
   participant R as Resolver
   participant A as addr2line
   participant W as Writer
@@ -130,7 +130,7 @@ sequenceDiagram
 - The following binaries must be available in your `PATH`:
   - LLVM mode: `llvm-addr2line`
   - GNU mode: `addr2line`
-  - `.gnu_debuglink` parsing: `readelf` (or cross-prefixed `&lt;prefix&gt;readelf`)
+  - `.gnu_debuglink` parsing: `readelf` (or cross-prefixed `<prefix>readelf`)
 - SQLite:
   - Uses Python’s standard `sqlite3` module; no extra installation required.
   - If `--cache-db` is not used, SQLite is not touched.
@@ -142,7 +142,7 @@ sequenceDiagram
 You can run the script directly. For example:
 
 ```bash
-git clone <your-repo-url>; cd quick_symbolizer
+git clone https://github.com/juitem/qms
 cd quick_symbolizer
 python3 quick_multi_symbolizer.py -h
 ```
