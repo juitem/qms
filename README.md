@@ -284,7 +284,7 @@ python quick_multi_symbolizer.py \
 - Every run symbolizes all addresses from scratch.
 - Without `--debug-root`, build-id debug files are looked up under `<rootfs>/.build-id` by default.
 
-### 5. Auto parallelism example
+### 4. Auto parallelism example
 
 ```bash
 python quick_multi_symbolizer.py \
@@ -295,7 +295,7 @@ python quick_multi_symbolizer.py \
   --workers-rewrite auto
 ```
 
-### 4. Benchmark mode
+### 5. Benchmark mode
 
 ```bash
 python quick_multi_symbolizer.py \
