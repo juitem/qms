@@ -62,7 +62,7 @@ jobs:
 # -------------------------------------------------------
   macos-intel:
     name: macOS Intel (x86_64)
-    runs-on: macos-13
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -117,8 +117,7 @@ jobs:
     runs-on: macos-latest
     needs:
       - macos-intel
-    # arm64 빌드도 필요하면 주석 해제
-    #  - macos-arm
+      - macos-arm
 
     steps:
       - name: Download macOS x86_64 artifact
