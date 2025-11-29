@@ -62,7 +62,7 @@ jobs:
 # -------------------------------------------------------
   macos-intel:
     name: macOS Intel (x86_64)
-    runs-on: macos-15
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout
