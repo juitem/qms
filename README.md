@@ -1,4 +1,4 @@
-# quick_symbolizer
+# QMS(Quick Multi Symbolizer)
 
 `quick_asan_symbolizer.py` is a fast, parallel ASan/Crash log symbolizer for ELF binaries.
 
