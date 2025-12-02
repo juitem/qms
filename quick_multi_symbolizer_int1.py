@@ -46,6 +46,8 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 
 # ==========================
@@ -229,11 +231,16 @@ class Addr2LineProcess:
     Each address produces exactly 2 lines (func, loc).
     """
 
-    def __init__(self, addr2line_bin: str, elf_path: str):
+    def __init__(self, addr2line_bin: str, elf_path: str, demangle: bool):
         self.addr2line_bin = addr2line_bin
         self.elf_path = elf_path
+        # -C => demangle C++ symbols
+        if demangle:
+            args = [self.addr2line_bin, "-fCpe", self.elf_path]
+        else:
+            args = [self.addr2line_bin, "-fpe", self.elf_path]
         self.proc = subprocess.Popen(
-            [self.addr2line_bin, "-fCpe", self.elf_path],
+            args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -290,14 +297,26 @@ class Addr2LineProcess:
 # Inline mode addr2line wrapper
 # ==========================
 
-def run_addr2line_inline(addr2line_bin: str, elf_path: str, offset: str) -> SymbolInfo:
+def run_addr2line_inline(
+    addr2line_bin: str,
+    elf_path: str,
+    offset: str,
+    demangle: bool,
+) -> SymbolInfo:
     """
     Call addr2line once for a single address with -i to get inlined frames.
     We store all frames in SymbolInfo.frames.
     """
+    # -i : show inlined frames
+    # -C : demangle C++ symbols (optional)
+    if demangle:
+        cmd = [addr2line_bin, "-fCpei", elf_path, offset]
+    else:
+        cmd = [addr2line_bin, "-fpei", elf_path, offset]
+
     try:
         out = subprocess.check_output(
-            [addr2line_bin, "-fCpei", elf_path, offset],
+            cmd,
             stderr=subprocess.DEVNULL,
             text=True,
         )
@@ -590,7 +609,7 @@ def build_jobs_by_target(
 # ==========================
 
 def _symbolize_one_elf(args):
-    addr2line_bin, target_elf, origin_keys, origins_by_target, use_inline = args
+    addr2line_bin, target_elf, origin_keys, origins_by_target, use_inline, demangle = args
     results: Dict[OriginKey, SymbolInfo] = {}
     failures_local: List[FailureInfo] = []
 
@@ -612,12 +631,12 @@ def _symbolize_one_elf(args):
         # Inline mode: one addr2line call per address
         for key in origin_keys:
             info = origins_by_target[key]
-            sym = run_addr2line_inline(addr2line_bin, target_elf, key.offset)
+            sym = run_addr2line_inline(addr2line_bin, target_elf, key.offset, demangle)
             results[key] = sym
         return results, failures_local
 
     # Non-inline mode: persistent addr2line process
-    proc = Addr2LineProcess(addr2line_bin, target_elf)
+    proc = Addr2LineProcess(addr2line_bin, target_elf, demangle)
     try:
         offsets = sorted({key.offset for key in origin_keys})
         symmap = proc.symbolize_many(offsets)
@@ -649,10 +668,12 @@ def symbolize_all_parallel(
     origins: Dict[OriginKey, OriginInfo],
     workers: int,
     use_inline: bool,
+    demangle: bool,
+    progress: bool,
 ) -> Tuple[Dict[OriginKey, SymbolInfo], List[FailureInfo]]:
     workers = max(1, workers)
     tasks = [
-        (addr2line_bin, target_elf, origin_keys, origins, use_inline)
+        (addr2line_bin, target_elf, origin_keys, origins, use_inline, demangle)
         for target_elf, origin_keys in jobs_by_target.items()
     ]
 
@@ -662,10 +683,17 @@ def symbolize_all_parallel(
     if not tasks:
         return combined_results, combined_failures
 
+    total = len(tasks)
+    completed = 0
+
     with Pool(workers) as pool:
         for res, fails in pool.imap_unordered(_symbolize_one_elf, tasks):
             combined_results.update(res)
             combined_failures.extend(fails)
+            if progress:
+                completed += 1
+                pct = (completed * 100.0) / total
+                print(f"[PROGRESS] ELF {completed}/{total} ({pct:.1f}%)")
 
     return combined_results, combined_failures
 
@@ -820,6 +848,7 @@ def rewrite_files_parallel(
     output_dir: str,
     cache: Dict[OriginKey, SymbolInfo],
     workers: int,
+    progress: bool,
 ) -> None:
     tasks = []
     for dirpath, _, filenames in os.walk(input_dir):
@@ -833,8 +862,24 @@ def rewrite_files_parallel(
     if not tasks:
         return
 
-    with Pool(workers) as pool:
-        pool.map(_rewrite_one_file, tasks)
+    total_files = len(tasks)
+
+    # Use ThreadPoolExecutor for I/O-bound file rewrite (backup-style behavior)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        if progress:
+            completed = 0
+            futures = [executor.submit(_rewrite_one_file, t) for t in tasks]
+            for _ in as_completed(futures):
+                completed += 1
+                pct = (completed * 100.0) / total_files
+                print(
+                    f"\r[PROGRESS] files {completed}/{total_files} ({pct:.1f}%)",
+                    end="",
+                    flush=True,
+                )
+            print()
+        else:
+            executor.map(_rewrite_one_file, tasks)
 
 
 # ==========================
@@ -869,8 +914,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Parallel stack trace symbolizer with GNU/LLVM modes, inline expansion, recursive debug search, and SQLite cache."
     )
-    parser.add_argument("--input_dir", required=True, help="Input directory containing log files")
-    parser.add_argument("--output_dir", required=True, help="Output directory for rewritten logs")
+    parser.add_argument(
+        "--input-dir",
+        dest="input_dir",
+        required=True,
+        help="Input directory containing log files",
+    )
+    parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        required=True,
+        help="Output directory for rewritten logs",
+    )
 
     parser.add_argument(
         "--mode",
@@ -902,14 +957,17 @@ def main():
     parser.add_argument(
         "--addr2line-bin",
         default="addr2line",
-        help="Base addr2line binary name/path (without cross prefix).",
+        help=(
+            "Base addr2line binary name/path (without cross prefix). "
+            "In llvm mode, the default 'addr2line' is treated as 'llvm-addr2line'."
+        ),
     )
     parser.add_argument(
         "-c",
         "--cross-prefix",
         default=None,
         help="Cross toolchain prefix (e.g. aarch64-linux-gnu-). Will prepend this "
-             "to 'addr2line'.",
+             "to 'addr2line' in gnu mode.",
     )
 
     parser.add_argument(
@@ -931,13 +989,46 @@ def main():
         help="SQLite cache DB path for (orig_elf, offset) -> frames(JSON).",
     )
 
+    # Demangle switch: default = True (keep current behavior),
+    # user can explicitly disable with --no-demangle.
+    demangle_group = parser.add_mutually_exclusive_group()
+    demangle_group.add_argument(
+        "-d",
+        "--demangle",
+        dest="demangle",
+        action="store_true",
+        help="Enable C++ name demangling (pass -C to addr2line). Default: on.",
+    )
+    demangle_group.add_argument(
+        "--no-demangle",
+        dest="demangle",
+        action="store_false",
+        help="Disable C++ name demangling (do not pass -C).",
+    )
+    parser.set_defaults(demangle=True)
+
     parser.add_argument(
         "--inline",
         action="store_true",
         help="Use addr2line -i and expand inlined frames as separate stack entries (slower).",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Print timing information for major phases.",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print progress for symbolization and file rewrite.",
+    )
 
     args = parser.parse_args()
+
+    benchmark = args.benchmark
+    if benchmark:
+        t_start = perf_counter()
+        t_prev = t_start
 
     rootfs = os.path.abspath(args.rootfs)
     if not os.path.isdir(rootfs):
@@ -955,7 +1046,19 @@ def main():
                 )
                 sys.exit(1)
 
-    addr2line_bin = build_addr2line_bin(args.addr2line_bin, args.cross_prefix)
+    # Decide which addr2line binary to use based on mode.
+    if args.mode == "llvm":
+        # LLVM mode:
+        #  - If user left the default 'addr2line', interpret it as 'llvm-addr2line'.
+        #  - If user explicitly set something, respect it as-is.
+        if args.addr2line_bin == "addr2line":
+            addr2line_bin = "llvm-addr2line"
+        else:
+            addr2line_bin = args.addr2line_bin
+    else:
+        # GNU mode:
+        #  - Allow cross-prefix + addr2line (e.g. aarch64-linux-gnu-addr2line).
+        addr2line_bin = build_addr2line_bin(args.addr2line_bin, args.cross_prefix)
 
     try:
         subprocess.check_output([addr2line_bin, "--version"], stderr=subprocess.DEVNULL)
@@ -973,6 +1076,10 @@ def main():
     print("[INFO] Collecting origins...")
     origins = collect_origins(input_dir)
     print(f"[INFO] Collected {len(origins)} unique (ELF, offset) pairs.")
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] collect_origins: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 2) Load cache from DB (if any)
     cache_db_initial: Dict[OriginKey, SymbolInfo] = {}
@@ -980,6 +1087,10 @@ def main():
         print(f"[INFO] Loading cache from DB: {args.cache_db}")
         cache_db_initial = load_cache_from_db(args.cache_db)
         print(f"[INFO] Cache DB entries: {len(cache_db_initial)}")
+        if benchmark:
+            t_now = perf_counter()
+            print(f"[BENCH] load_cache_from_db: {t_now - t_prev:.3f}s")
+            t_prev = t_now
 
     # 3) Recursive debug map (optional)
     recursive_debug_map: Dict[str, List[str]] = {}
@@ -987,17 +1098,18 @@ def main():
         print("[INFO] Building recursive debug map from debug-root paths...")
         recursive_debug_map = build_recursive_debug_map(rootfs, debug_roots_logical)
         print(f"[INFO] Recursive debug map entries (basenames): {len(recursive_debug_map)}")
+        if benchmark:
+            t_now = perf_counter()
+            print(f"[BENCH] build_recursive_debug_map: {t_now - t_prev:.3f}s")
+            t_prev = t_now
 
     # 4) Decide which origins to symbolize this run
-    if args.inline:
-        # Inline mode: recompute everything, even if it exists in DB
-        remaining_origins: Dict[OriginKey, OriginInfo] = dict(origins)
-    else:
-        # Non-inline mode: skip cached ones
-        remaining_origins = {}
-        for k, v in origins.items():
-            if k not in cache_db_initial:
-                remaining_origins[k] = v
+    # Use cache DB for both inline and non-inline modes:
+    # if an origin is already in the DB, do not re-symbolize it.
+    remaining_origins: Dict[OriginKey, OriginInfo] = {}
+    for k, v in origins.items():
+        if k not in cache_db_initial:
+            remaining_origins[k] = v
 
     print(f"[INFO] New origins to symbolize: {len(remaining_origins)}")
 
@@ -1009,6 +1121,10 @@ def main():
         debug_roots_logical=debug_roots_logical,
         recursive_debug_map=recursive_debug_map,
     )
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] build_jobs_by_target: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 6) Symbolize in parallel for remaining origins
     new_cache: Dict[OriginKey, SymbolInfo] = {}
@@ -1017,17 +1133,24 @@ def main():
     if jobs_by_target:
         print(
             f"[INFO] Symbolizing for {len(jobs_by_target)} target ELFs "
-            f"with {args.symbol_workers} workers (inline={args.inline})..."
+            f"with {args.workers_symbols} workers "
+            f"(inline={args.inline}, demangle={args.demangle})..."
         )
         sym_results, sym_failures = symbolize_all_parallel(
             addr2line_bin,
             jobs_by_target,
             remaining_origins,
-            workers=args.symbol_workers,
+            workers=args.workers_symbols,
             use_inline=args.inline,
+            demangle=args.demangle,
+            progress=args.progress,
         )
         new_cache.update(sym_results)
         print(f"[INFO] New symbolized entries: {len(new_cache)}")
+        if benchmark:
+            t_now = perf_counter()
+            print(f"[BENCH] symbolize_all_parallel: {t_now - t_prev:.3f}s")
+            t_prev = t_now
     else:
         print("[INFO] No new origins to symbolize.")
 
@@ -1035,6 +1158,10 @@ def main():
     if args.cache_db and new_cache:
         print(f"[INFO] Saving {len(new_cache)} new entries to cache DB...")
         save_cache_to_db(args.cache_db, new_cache)
+        if benchmark:
+            t_now = perf_counter()
+            print(f"[BENCH] save_cache_to_db: {t_now - t_prev:.3f}s")
+            t_prev = t_now
 
     # 8) Build final in-memory cache
     final_cache: Dict[OriginKey, SymbolInfo] = dict(cache_db_initial)
@@ -1044,9 +1171,19 @@ def main():
     # 9) Rewrite files in parallel
     print(
         f"[INFO] Rewriting files from '{input_dir}' to '{output_dir}' "
-        f"with {args.rewrite_workers} workers..."
+        f"with {args.workers_rewrite} workers..."
     )
-    rewrite_files_parallel(input_dir, output_dir, final_cache, args.rewrite_workers)
+    rewrite_files_parallel(
+        input_dir,
+        output_dir,
+        final_cache,
+        args.workers_rewrite,
+        progress=args.progress,
+    )
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] rewrite_files_parallel: {t_now - t_prev:.3f}s")
+        t_prev = t_now
 
     # 10) Save failures
     failures_all = debug_failures + sym_failures
@@ -1055,6 +1192,10 @@ def main():
         save_failures(failures_all, output_dir)
     else:
         print("[INFO] No failures recorded.")
+    if benchmark:
+        t_now = perf_counter()
+        print(f"[BENCH] save_failures: {t_now - t_prev:.3f}s")
+        print(f"[BENCH] total_time: {t_now - t_start:.3f}s")
 
     print("[INFO] Done.")
 
