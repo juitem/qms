@@ -521,6 +521,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--chmod-scope",
+        choices=("outdir", "rootfs"),
+        default="outdir",
+        help=(
+            "Scope for chmod operation when --chmod is used: "
+            "'outdir' (default) only touches the extracted subtree, "
+            "'rootfs' uses the logical ROOTFS directory."
+        ),
+    )
+    parser.add_argument(
         "--logfile-rootfs",
         help="Log file path for rootfs extraction logs (overwritten on each run).",
     )
@@ -547,6 +557,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to save report of root-owned directories and files.",
     )
     parser.add_argument(
+        "--rootfs-dir",
+        help=(
+            "Logical ROOTFS directory corresponding to '/'. "
+            "If not set, defaults to the outdir for this image."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Verbose output to stdout."
     )
     return parser.parse_args()
@@ -557,6 +574,7 @@ def run_hybrid(
     outdir: str,
     mode: int,
     chmod_mode: str | None,
+    chmod_scope: str,
     logfile_rootfs: str | None,
     dry_run: bool,
     verbose: bool,
@@ -564,10 +582,14 @@ def run_hybrid(
     logfile_symlink: str | None,
     broken_report_symlink: str | None,
     root_owned_report: str | None,
+    rootfs_dir: str | None,
 ) -> int:
     log_fp = open_log(logfile_rootfs)
     image = os.path.abspath(image)
     outdir = os.path.abspath(outdir)
+    rootfs_dir_effective = (
+        os.path.abspath(rootfs_dir) if rootfs_dir else outdir
+    )
 
     # Basic environment checks
     if mode in (1, 2, 3):
@@ -580,9 +602,10 @@ def run_hybrid(
     if verbose:
         log(log_fp, "INFO", f"IMAGE: {image}")
         log(log_fp, "INFO", f"OUTPUT DIR: {outdir}")
+        log(log_fp, "INFO", f"ROOTFS DIR (logical '/'): {rootfs_dir_effective}")
         log(log_fp, "INFO", f"MODE: {mode}")
         if chmod_mode:
-            log(log_fp, "INFO", f"CHMOD: {chmod_mode}")
+            log(log_fp, "INFO", f"CHMOD: {chmod_mode} (scope={chmod_scope})")
         log(log_fp, "INFO", f"DRY-RUN: {dry_run}")
 
     result: Dict[str, int] = {
@@ -618,9 +641,17 @@ def run_hybrid(
 
     chmod_errors = 0
     if chmod_mode:
-        log(log_fp, "INFO", f"Applying chmod -R {chmod_mode} to {outdir}")
+        if chmod_scope == "rootfs":
+            chmod_target = rootfs_dir_effective
+        else:
+            chmod_target = outdir
+        log(
+            log_fp,
+            "INFO",
+            f"Applying chmod -R {chmod_mode} to {chmod_target} (scope={chmod_scope})",
+        )
         _, chmod_errors = apply_chmod_recursive(
-            outdir, chmod_mode, dry_run, log_fp, verbose
+            chmod_target, chmod_mode, dry_run, log_fp, verbose
         )
 
     # Optional symlink rewrite step
@@ -630,7 +661,7 @@ def run_hybrid(
         log(log_fp, "INFO", "Running symlink rewrite step.")
         try:
             rewrite_symlinks(
-                rootfs_dir=outdir,
+                rootfs_dir=rootfs_dir_effective,
                 target_dir=outdir,
                 dry_run=dry_run,
                 logfile_symlink=logfile_symlink,
@@ -651,8 +682,10 @@ def run_hybrid(
 
     # Summary
     logfile_display = logfile_rootfs if logfile_rootfs else "-"
-    warnings_total = result.get("warnings", 0)
-    errors_total = result.get("errors", 0) + chmod_errors + extra_rewrite_error
+    warnings_total = result.get("warnings", 0) + chmod_errors
+    errors_total = result.get("errors", 0) + extra_rewrite_error
+    # warnings_total = result.get("warnings", 0)
+    # errors_total = result.get("errors", 0) + chmod_errors + extra_rewrite_error
 
     print("[Convert RootFS]")
     print(f"       IMAGE: {image}")
@@ -681,6 +714,7 @@ def main() -> None:
         outdir=args.outdir,
         mode=args.mode,
         chmod_mode=args.chmod,
+        chmod_scope=args.chmod_scope,
         logfile_rootfs=args.logfile_rootfs,
         dry_run=args.dry_run,
         verbose=args.verbose,
@@ -688,6 +722,7 @@ def main() -> None:
         logfile_symlink=args.logfile_symlink,
         broken_report_symlink=args.broken_report_symlink,
         root_owned_report=args.root_owned_report,
+        rootfs_dir=args.rootfs_dir,
     )
     if rc != 0:
         sys.exit(rc)

@@ -16,7 +16,7 @@ mkdir -p "${LOGDIR}"
 echo "[INFO] Chown log start" > "${CHOWN_LOG}"
 
 # 1. Extract only (NO chmod, NO symlink rewrite here)
-python3 rootfs_genertor/hybrid_rootfs_gen_v2.py \
+python3 rootfs_generator/hybrid_rootfs_gen_v2.py \
   "${IMG}" \
   --outdir "${ROOTFS}" \
   --mode 3 \
