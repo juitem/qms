@@ -134,4 +134,4 @@ qss.py   --input-dir ./stack_logs   --output-dir ./stack_sym   --rootfs /mnt/tiz
 
 - 스택 유사도 기반 그룹핑  
 - JSON 출력  
-- 웹 기반 뷰어 연동 가능  
+- 웹 기반 뷰어 연동 가능
