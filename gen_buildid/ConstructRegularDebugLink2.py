@@ -3,45 +3,26 @@
 ConstructRegularDebugLink.py
 
 Scan ELF files under the given rootfs (and target directories inside it),
-extract GNU build-id, and create build-id-based symlinks for each ELF:
-
-  - For main ELFs (non-debug paths):
-      <rootfs>/usr/lib/.build-id/xx/yyyy  -> <elf_rel>
-
-  - For debug ELFs (under /usr/lib/debug or *.debug):
-      <rootfs>/usr/lib/debug/.build-id/xx/yyyy.debug -> <elf_rel>
-
-Here, <elf_rel> is the rootfs-relative path of the ELF (starting with '/').
+extract GNU build-id, and create /usr/lib/debug/.build-id/xx/yyyy.debug
+symlinks for each unique physical ELF (realpath-based).
 
 Design / policy:
 
-  - We do NOT try to "infer" debug paths from main paths.
-    Each ELF (main or debug) is linked directly to its own path.
-
   - main (stripped) ELF:
-      Typically used for execution.
-      We create/maintain main build-id links under:
-          /usr/lib/.build-id/xx/yyyy
+      Rootfs contains stripped main ELFs for execution.
+      Their build-id -> main mapping (e.g. /usr/lib/.build-id/xx/yyyy) is
+      considered read-only and is NOT modified by this script.
 
   - debug ELF:
-      Full debug ELFs may live in various directories such as:
-          /usr/lib/debug/usr/lib64/...
-          /usr/lib/debug/lib64/...
-          /usr/lib/debug/lib64.tizen-debug/...
-      We create/maintain debug build-id links under:
+      Separate full debug ELFs exist under /usr/lib/debug/<elf_rel>.debug.
+      We create and maintain *debug* build-id links:
           /usr/lib/debug/.build-id/xx/yyyy.debug
+      that point to those debug ELFs.
 
   - realpath-based:
-      Each physical ELF file is processed only once per (elf_type, build-id, real_abs).
-      Multiple symlink paths that resolve to the same file share the same key.
-
-Overwrite policy:
-
-  - When a build-id link already exists and --overwrite is given:
-      * If both existing target and new candidate can be stat'ed:
-          - If new candidate size > existing size: overwrite (prefer bigger ELF).
-          - Otherwise: keep existing link.
-      * If sizes cannot be obtained: fallback to always overwrite (legacy behavior).
+      Each physical ELF file is processed only once.
+      Multiple symlink paths that resolve to the same real file share the same
+      build-id and debug target (dedup by (build_id, real_abs)).
 
 TSV logging:
 
@@ -54,19 +35,17 @@ TSV logging:
         "created",
         "overwritten",
         "kept",
-        "kept_larger_existing",
         "skipped_existing_symlink",
         "skipped_existing_nonsymlink",
         "error_readlink",
         "realpath_outside_rootfs",
-        "no_build_id"
+        "no_debug_candidate"
     - build_id: hex string of GNU build-id (no spaces)
     - elf_type: "main" or "debug" (based on ELF path)
     - elf_path_rel: rootfs-relative path to the *real* ELF (starting with '/')
-    - debug_target_rel: rootfs-relative path to the ELF used as link target
-                        (column name kept for backward compatibility; holds
-                         main or debug ELF paths for both elf_type values)
-    - link_path_rel: rootfs-relative path to the build-id symlink
+    - debug_target_rel: rootfs-relative path to debug ELF (or "-" if none)
+    - link_path_rel: rootfs-relative path to the .build-id.debug symlink
+                     (or "-" if not applicable)
 """
 
 import argparse
@@ -90,8 +69,8 @@ DEFAULT_LOG_TSV_PATH = os.path.join(".", "download", "logs", "genID.tsv")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Construct build-id symlinks under /usr/lib/.build-id and "
-            "/usr/lib/debug/.build-id based on GNU build-id of ELFs in the rootfs."
+            "Construct debug .build-id symlinks under /usr/lib/debug/.build-id "
+            "based on GNU build-id of ELFs in the rootfs."
         )
     )
     parser.add_argument(
@@ -114,14 +93,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Debug .build-id root (host path). "
             "Default: <rootfs>/usr/lib/debug/.build-id"
-        ),
-    )
-    parser.add_argument(
-        "--main-root",
-        default=None,
-        help=(
-            "Main .build-id root (host path) for non-debug ELFs. "
-            "Default: <rootfs>/usr/lib/.build-id"
         ),
     )
     parser.add_argument(
@@ -150,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing build-id links if they already exist (symlinks only).",
+        help="Overwrite existing debug .build-id links if they already exist (symlinks only).",
     )
     parser.add_argument(
         "--dry-run",
@@ -357,15 +328,37 @@ def classify_elf_type(rel_path: str) -> str:
     return "main"
 
 
-def make_build_id_link_path(root: str, build_id: str, elf_type: str) -> str:
+def find_debug_candidate(rootfs: str, elf_rel: str) -> str | None:
     """
-    Construct the host-absolute path to the build-id link:
+    Given rootfs and a rootfs-relative *real* main ELF path, find a separate debug ELF.
 
-      - For elf_type == "main":
-          root/xx/yyyy
+    Policy:
+      - Only use /usr/lib/debug/<elf_rel>.debug as debug target.
+      - Never fall back to the stripped main ELF.
 
-      - For elf_type == "debug":
-          root/xx/yyyy.debug
+    Returns:
+        rootfs-relative path to debug target, or None if not found.
+    """
+    # Standard separate debug file: /usr/lib/debug/<elf_rel>.debug
+    # Example:
+    #   elf_rel   = /usr/lib64/libfoo.so.1.2.3
+    #   debug_rel = /usr/lib/debug/usr/lib64/libfoo.so.1.2.3.debug
+    debug_rel = "/usr/lib/debug" + elf_rel + ".debug"
+    debug_abs = os.path.join(rootfs, debug_rel.lstrip("/"))
+    if os.path.exists(debug_abs):
+        return debug_rel
+
+    # No separate debug ELF -> do not create a build-id link for this ELF
+    return None
+
+
+def make_build_id_debug_link_path(debug_root: str, build_id: str) -> str:
+    """
+    Construct the host-absolute path to the debug build-id link:
+      debug_root/xx/yyyy...debug
+
+    debug_root: host path to debug .build-id root (e.g. <rootfs>/usr/lib/debug/.build-id)
+    build_id: full hex build-id string
     """
     if len(build_id) < 3:
         prefix = build_id[:2]
@@ -373,11 +366,8 @@ def make_build_id_link_path(root: str, build_id: str, elf_type: str) -> str:
     else:
         prefix = build_id[:2]
         rest = build_id[2:]
-    dir_path = os.path.join(root, prefix)
-    if elf_type == "debug":
-        file_name = rest + ".debug"
-    else:
-        file_name = rest
+    dir_path = os.path.join(debug_root, prefix)
+    file_name = rest + ".debug"
     return os.path.join(dir_path, file_name)
 
 
@@ -411,61 +401,6 @@ def count_buildid_links(root: str, kind: str) -> int:
     return total
 
 
-def resolve_realpath_within_rootfs(rootfs_real: str, abs_path: str, max_symlinks: int = 40) -> str | None:
-    """
-    Resolve symlinks for abs_path, interpreting absolute symlink targets
-    as paths *inside* rootfs_real.
-
-    Example:
-        rootfs_real = /home/.../ROOTFS
-        abs_path    = /home/.../ROOTFS/usr/lib64/libc.so.6
-        if this is a symlink to /lib64/libc.so.6, we treat the target as
-        /home/.../ROOTFS/lib64/libc.so.6 (not host /lib64/...).
-
-    Returns:
-        - Final resolved absolute path (host path) within rootfs_real, or
-        - None if resolution escapes rootfs_real or exceeds max_symlinks.
-    """
-    # Normalize starting point
-    current = os.path.abspath(abs_path)
-    visited: set[str] = set()
-
-    for _ in range(max_symlinks):
-        if not os.path.islink(current):
-            break
-
-        if current in visited:
-            # Symlink loop
-            return None
-        visited.add(current)
-
-        try:
-            target = os.readlink(current)
-        except OSError:
-            # Cannot read symlink; treat as failure
-            return None
-
-        if os.path.isabs(target):
-            # Absolute target: interpret inside rootfs_real
-            next_path = os.path.join(rootfs_real, target.lstrip(os.sep))
-        else:
-            # Relative target: resolve relative to directory of current
-            next_path = os.path.normpath(os.path.join(os.path.dirname(current), target))
-
-        # Ensure we stay within rootfs_real
-        next_real = os.path.abspath(next_path)
-        if not (next_real == rootfs_real or next_real.startswith(rootfs_real + os.sep)):
-            return None
-
-        current = next_real
-
-    # Final sanity check: must still be under rootfs_real
-    current_real = os.path.abspath(current)
-    if not (current_real == rootfs_real or current_real.startswith(rootfs_real + os.sep)):
-        return None
-
-    return current_real
-
 # ------------------------------------------------------------
 # Core processing
 # ------------------------------------------------------------
@@ -473,7 +408,6 @@ def process_elf(
     abs_path: str,
     rootfs: str,
     debug_root: str,
-    main_root: str,
     args: argparse.Namespace,
     stats: dict,
     log_tsv_path: str,
@@ -483,27 +417,25 @@ def process_elf(
       - resolve realpath
       - check it is inside rootfs
       - get build-id
-      - deduplicate by (elf_type, build_id, real_abs)
-      - choose link root (main_root or debug_root)
-      - create/overwrite/keep/skip build-id symlink
+      - deduplicate by (build_id, real_abs)
+      - find debug target (separate debug ELF)
+      - create/overwrite/keep/skip debug .build-id.symlink
       - log to TSV
     """
     stats["elf_files"] += 1
 
-    # 1) Realpath canonicalization (rootfs-aware)
+    # 1) Realpath canonicalization
+    real_abs = os.path.realpath(abs_path)
+
+    # Ensure real_abs is inside rootfs
     rootfs_real = os.path.realpath(rootfs)
-    real_abs = resolve_realpath_within_rootfs(rootfs_real, abs_path)
-
-    if real_abs is None:
-        # ELF resolves outside the rootfs (e.g. symlink chain escapes rootfs),
-        # or we hit a loop / unreadable symlink. Log and skip.
+    if not (real_abs == rootfs_real or real_abs.startswith(rootfs_real + os.sep)):
+        # ELF resolves outside the rootfs (e.g. symlink to host), skip it
         if args.verbose:
-            print(f"[skip-outside-rootfs] {abs_path} (could not resolve within rootfs)")
+            print(f"[skip-outside-rootfs] {abs_path} -> {real_abs}")
         stats["realpath_outside_rootfs"] += 1
-
-        # Log the original path (relative to rootfs) so we can inspect later
-        elf_rel = to_rootfs_rel(rootfs_real, abs_path)
-        elf_type = classify_elf_type(elf_rel)
+        elf_rel = "-"
+        elf_type = "main"
         log_link(
             action="realpath_outside_rootfs",
             build_id=None,
@@ -519,6 +451,12 @@ def process_elf(
     # 2) Compute rootfs-relative path for the real file
     elf_rel = to_rootfs_rel(rootfs_real, real_abs)
     elf_type = classify_elf_type(elf_rel)
+
+    # 2.5) Skip debug ELF as a *source*; we only use main ELFs to create build-id links
+    if elf_type == "debug":
+        if args.verbose:
+            print(f"[skip-debug-elf] {elf_rel}")
+        return
 
     # 3) Extract build-id
     build_id = get_build_id(real_abs, args.buildid_backend)
@@ -538,28 +476,23 @@ def process_elf(
         )
         return
 
-    # 4) Deduplicate by (elf_type, build_id, real_abs)
-    key = (elf_type, build_id, real_abs)
+    # 4) Deduplicate by (build_id, real_abs)
+    key = (build_id, real_abs)
     if key in stats["seen_keys"]:
-        # Already processed this physical ELF for this build-id and type
+        # Already processed this physical ELF for this build-id
         if args.verbose:
-            print(f"[duplicate-skip] {real_abs} (elf_type={elf_type}, build-id={build_id})")
+            print(f"[duplicate-skip] {real_abs} (build-id={build_id})")
         return
     stats["seen_keys"].add(key)
 
-    # 5) Choose link root and link target (the ELF itself)
-    if elf_type == "debug":
-        link_root = debug_root
-    else:
-        link_root = main_root
-
-    # If for some reason link_root is not set, skip gracefully
-    if not link_root:
+    # 5) Locate separate debug ELF (do not fall back to main)
+    debug_target_rel = find_debug_candidate(rootfs_real, elf_rel)
+    if not debug_target_rel:
+        stats["no_debug_candidate"] += 1
         if args.verbose:
-            print(f"[no-link-root] {real_abs} (elf_type={elf_type}, build-id={build_id})")
-        stats["links_existing_skipped"] += 1
+            print(f"[no-debug-target] {real_abs} (build-id={build_id})")
         log_link(
-            action="skipped_existing_nonsymlink",
+            action="no_debug_candidate",
             build_id=build_id,
             elf_type=elf_type,
             elf_path_rel=elf_rel,
@@ -570,13 +503,13 @@ def process_elf(
         )
         return
 
-    # Target for the link is always this ELF itself (rootfs-relative path)
-    link_target = elf_rel
-
-    # 6) Compute build-id link path under link_root (host path)
-    link_abs = make_build_id_link_path(link_root, build_id, elf_type)
+    # 6) Compute debug build-id link path under debug_root (host path)
+    link_abs = make_build_id_debug_link_path(debug_root, build_id)
     link_dir = os.path.dirname(link_abs)
     ensure_dir(link_dir)
+
+    # Debug link target is rootfs-relative path (e.g. /usr/lib/debug/...)
+    link_target = debug_target_rel
 
     # Rootfs-relative link path for logging
     link_rel = to_rootfs_rel(rootfs_real, link_abs)
@@ -597,7 +530,7 @@ def process_elf(
                     build_id=build_id,
                     elf_type=elf_type,
                     elf_path_rel=elf_rel,
-                    debug_target_rel=link_target,
+                    debug_target_rel=debug_target_rel,
                     link_path_rel=link_rel,
                     log_path=log_tsv_path,
                     dry_run=args.dry_run,
@@ -617,7 +550,7 @@ def process_elf(
                     build_id=build_id,
                     elf_type=elf_type,
                     elf_path_rel=elf_rel,
-                    debug_target_rel=link_target,
+                    debug_target_rel=debug_target_rel,
                     link_path_rel=link_rel,
                     log_path=log_tsv_path,
                     dry_run=args.dry_run,
@@ -633,7 +566,7 @@ def process_elf(
                 current_size = -1
                 new_size = -1
 
-                # Both targets are stored as rootfs-relative paths (e.g. /usr/lib/... or /usr/lib/debug/...)
+                # Both targets are stored as rootfs-relative paths (e.g. /usr/lib/debug/...)
                 # Try to resolve them to real files under rootfs for size comparison.
                 if current_target.startswith("/"):
                     current_abs = os.path.join(rootfs_real, current_target.lstrip("/"))
@@ -670,8 +603,7 @@ def process_elf(
                         print(
                             f"[overwrite] {link_abs} : {current_target} -> {link_target} "
                             f"(from {elf_rel}, build-id={build_id}, "
-                            f"current_size={current_size}, new_size={new_size}, "
-                            f"elf_type={elf_type})"
+                            f"current_size={current_size}, new_size={new_size})"
                         )
                     if not args.dry_run:
                         try:
@@ -688,7 +620,7 @@ def process_elf(
                         build_id=build_id,
                         elf_type=elf_type,
                         elf_path_rel=elf_rel,
-                        debug_target_rel=link_target,
+                        debug_target_rel=debug_target_rel,
                         link_path_rel=link_rel,
                         log_path=log_tsv_path,
                         dry_run=args.dry_run,
@@ -700,7 +632,7 @@ def process_elf(
                             f"[keep-larger] {link_abs} (symlink, "
                             f"current={current_target} size={current_size}, "
                             f"candidate={link_target} size={new_size}, "
-                            f"build-id={build_id}, elf_type={elf_type})"
+                            f"build-id={build_id})"
                         )
                     stats["links_existing_skipped"] += 1
                     log_link(
@@ -708,7 +640,7 @@ def process_elf(
                         build_id=build_id,
                         elf_type=elf_type,
                         elf_path_rel=elf_rel,
-                        debug_target_rel=link_target,
+                        debug_target_rel=debug_target_rel,
                         link_path_rel=link_rel,
                         log_path=log_tsv_path,
                         dry_run=args.dry_run,
@@ -718,7 +650,7 @@ def process_elf(
                 if args.verbose:
                     print(
                         f"[exists-skip] {link_abs} (symlink, target={current_target}, "
-                        f"desired={link_target}, build-id={build_id}, elf_type={elf_type})"
+                        f"desired={link_target}, build-id={build_id})"
                     )
                 stats["links_existing_skipped"] += 1
                 log_link(
@@ -726,36 +658,18 @@ def process_elf(
                     build_id=build_id,
                     elf_type=elf_type,
                     elf_path_rel=elf_rel,
-                    debug_target_rel=link_target,
+                    debug_target_rel=debug_target_rel,
                     link_path_rel=link_rel,
                     log_path=log_tsv_path,
                     dry_run=args.dry_run,
                 )
                 return
 
-        # Not a symlink: regular file or directory – do not touch
-        if args.verbose:
-            print(
-                f"[exists-skip] {link_abs} (non-symlink, preserved, build-id={build_id}, elf_type={elf_type})"
-            )
-        stats["links_existing_skipped"] += 1
-        log_link(
-            action="skipped_existing_nonsymlink",
-            build_id=build_id,
-            elf_type=elf_type,
-            elf_path_rel=elf_rel,
-            debug_target_rel=link_target,
-            link_path_rel=link_rel,
-            log_path=log_tsv_path,
-            dry_run=args.dry_run,
-        )
-        return
-
-    # 8) No existing link/file: create new build-id symlink
+    # 8) No existing link/file: create new debug build-id symlink
     if args.verbose:
         print(
             f"[create] {link_abs} -> {link_target} "
-            f"(from {elf_rel}, build-id={build_id}, elf_type={elf_type})"
+            f"(from {elf_rel}, build-id={build_id})"
         )
     if not args.dry_run:
         try:
@@ -770,7 +684,7 @@ def process_elf(
         build_id=build_id,
         elf_type=elf_type,
         elf_path_rel=elf_rel,
-        debug_target_rel=link_target,
+        debug_target_rel=debug_target_rel,
         link_path_rel=link_rel,
         log_path=log_tsv_path,
         dry_run=args.dry_run,
@@ -788,17 +702,10 @@ def main() -> None:
         sys.stderr.write(f"ERROR: rootfs directory not found: {rootfs}\n")
         sys.exit(1)
 
-    rootfs_real = os.path.realpath(rootfs)
-
     if args.debug_root:
         debug_root = os.path.abspath(args.debug_root)
     else:
-        debug_root = os.path.join(rootfs_real, "usr", "lib", "debug", ".build-id")
-
-    if args.main_root:
-        main_root = os.path.abspath(args.main_root)
-    else:
-        main_root = os.path.join(rootfs_real, "usr", "lib", ".build-id")
+        debug_root = os.path.join(rootfs, "usr", "lib", "debug", ".build-id")
 
     # TSV log absolute path
     tsv_log_path = os.path.abspath(args.tsv_log)
@@ -807,14 +714,14 @@ def main() -> None:
     scan_roots: list[str] = []
     for tgt in args.target:
         if tgt.upper() == "ALL":
-            scan_roots = [rootfs_real]
+            scan_roots = [rootfs]
             break
         # Treat tgt as path inside rootfs
         if tgt.startswith("/"):
             rel = tgt.lstrip("/")
         else:
             rel = tgt
-        abs_tgt = os.path.join(rootfs_real, rel)
+        abs_tgt = os.path.join(rootfs, rel)
         if os.path.isdir(abs_tgt):
             scan_roots.append(abs_tgt)
         else:
@@ -827,8 +734,7 @@ def main() -> None:
         sys.exit(1)
 
     if args.verbose:
-        print(f"rootfs          : {rootfs_real}")
-        print(f"main_root       : {main_root}")
+        print(f"rootfs          : {rootfs}")
         print(f"debug_root      : {debug_root}")
         print(f"tsv_log         : {tsv_log_path}")
         print(f"buildid_backend : {args.buildid_backend}")
@@ -843,13 +749,15 @@ def main() -> None:
         "scanned_files": 0,
         "elf_files": 0,
         "no_build_id": 0,
-        "no_debug_candidate": 0,  # kept for backward compatibility (unused)
+        "no_debug_candidate": 0,
         "realpath_outside_rootfs": 0,
         "links_created": 0,
         "links_overwritten": 0,
         "links_existing_skipped": 0,
-        "seen_keys": set(),  # (elf_type, build_id, real_abs)
+        "seen_keys": set(),  # (build_id, real_abs)
     }
+
+    rootfs_real = os.path.realpath(rootfs)
 
     for scan_root in scan_roots:
         for dirpath, dirnames, filenames in os.walk(
@@ -865,41 +773,37 @@ def main() -> None:
                 if not is_elf(full_path):
                     continue
 
-                process_elf(
-                    full_path,
-                    rootfs_real,
-                    debug_root,
-                    main_root,
-                    args,
-                    stats,
-                    tsv_log_path,
-                )
+                process_elf(full_path, rootfs_real, debug_root, args, stats, tsv_log_path)
 
     # Summary
     print("=== ConstructRegularDebugLink summary ===")
     print(f"rootfs                  : {rootfs_real}")
-    print(f"main_root (main)        : {main_root}")
     print(f"debug_root (debug)      : {debug_root}")
     print(f"scanned files           : {stats['scanned_files']}")
     print(f"ELF files               : {stats['elf_files']}")
     print(f"no build-id             : {stats['no_build_id']}")
     print(f"no debug candidate      : {stats['no_debug_candidate']}")
     print(f"realpath outside rootfs : {stats['realpath_outside_rootfs']}")
-    print(f"build-id links created  : {stats['links_created']}")
-    print(f"build-id links overwritten: {stats['links_overwritten']}")
-    print(f"build-id links skipped  : {stats['links_existing_skipped']}")
+    print(f"debug links created     : {stats['links_created']}")
+    print(f"debug links overwritten : {stats['links_overwritten']}")
+    print(f"debug links skipped     : {stats['links_existing_skipped']}")
 
     # Count existing debug build-id links (.debug) under debug_root
     debug_links_existing = count_buildid_links(debug_root, kind="debug")
 
-    # Count main build-id links under main_root
+    # Heuristic: main build-id root (strip ELF) is typically /usr/lib/.build-id under rootfs
+    main_buildid_root = os.path.join(rootfs_real, "usr", "lib", ".build-id")
     main_links_existing = 0
-    if os.path.isdir(main_root):
-        main_links_existing = count_buildid_links(main_root, kind="main")
+    if os.path.isdir(main_buildid_root):
+        main_links_existing = count_buildid_links(main_buildid_root, kind="main")
 
     print(f"debug links existing    : {debug_links_existing}")
     if main_links_existing > 0:
+        print(f"main  build-id root     : {main_buildid_root}")
         print(f"main  links existing    : {main_links_existing}")
+    else:
+        # Some images may not have a separate main .build-id tree.
+        pass
 
     if not args.dry_run:
         print(f"TSV log                 : {tsv_log_path}")
