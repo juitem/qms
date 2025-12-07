@@ -26,7 +26,7 @@ function repeat() {
     "${IMG}" \
     --rootfs-dir "${ROOTFS}" \
     --outdir "${OUTDIR}" \
-    --mode 3 \
+    --mode 1 \
     --logfile-rootfs "${LOGDIR}/rootfs_hybrid.log" \
     --root-owned-report "${LOGDIR}/root_owned_hybrid.log" \
     --chmod-scope rootfs \
@@ -96,6 +96,7 @@ OUTDIR=./download/img/ROOTFS/opt
 LOGDIR=./logs/opt
 CHOWN_LOG="${LOGDIR}/chown_opt.log"
 
+mkdir -p ./download/img/ROOTFS/opt/usr/home
 
 repeat "${IMG}" "${ROOTFS}" "${OUTDIR}" "${LOGDIR}" "chown_opt_hybrid.log"
 
