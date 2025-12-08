@@ -7,10 +7,13 @@ Thin wrapper around the external 'addr2line' command.
 Responsibilities:
   - Run addr2line with proper options (-f -C -i -e)
   - Parse its output into (function, file:line) pairs
+  - Provide an in-memory cache so that repeated lookups for the same
+    (binary, address) pair do not spawn addr2line multiple times.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import subprocess
 from dataclasses import dataclass
@@ -44,32 +47,13 @@ def _pair_lines(lines: List[str]) -> List[Tuple[str, str]]:
     return out
 
 
-def run_addr2line(
+def _run_addr2line_raw(
     addr: str,
-    elf_file: Path,
-    debug_file: Path | None = None,
-    prefer_debug: bool = True,
+    target: Path,
 ) -> Addr2lineResult:
     """
-    Run addr2line for a single address.
-
-    Parameters:
-        addr:
-            Address string for addr2line (e.g. "0x1fdb8").
-        elf_file:
-            Path to the main ELF file.
-        debug_file:
-            Path to the debug ELF file (if any).
-        prefer_debug:
-            If True and debug_file exists, use it instead of elf_file.
-
-    Returns:
-        Addr2lineResult with parsed frames.
+    Internal low-level runner that actually spawns the addr2line process.
     """
-    target = elf_file
-    if prefer_debug and debug_file is not None and debug_file.is_file():
-        target = debug_file
-
     cmd = [
         "addr2line",
         "-f",      # print function names
@@ -94,8 +78,11 @@ def run_addr2line(
         return Addr2lineResult(frames=[("??", "??")])
 
     if proc.returncode != 0:
-        LOG.warning("addr2line returned non-zero exit code %d: %s",
-                    proc.returncode, proc.stderr.strip())
+        LOG.warning(
+            "addr2line returned non-zero exit code %d: %s",
+            proc.returncode,
+            proc.stderr.strip(),
+        )
         return Addr2lineResult(frames=[("??", "??")])
 
     raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
@@ -104,6 +91,61 @@ def run_addr2line(
 
     pairs = _pair_lines(raw_lines)
     return Addr2lineResult(frames=pairs)
+
+
+@functools.lru_cache(maxsize=100_000)
+def _run_addr2line_cached(canonical_target: str, addr: str) -> Addr2lineResult:
+    """
+    Cached wrapper around _run_addr2line_raw.
+
+    Cache key:
+      (canonical_target, addr)
+        - canonical_target: canonical path to ELF/debug ELF
+        - addr: address string ("0x1fdb8")
+
+    canonical_target should be constructed using Path.resolve() or
+    similar so that different textual paths pointing to the same file
+    share the same cache entry.
+    """
+    target = Path(canonical_target)
+    return _run_addr2line_raw(addr=addr, target=target)
+
+
+def run_addr2line(
+    addr: str,
+    elf_file: Path,
+    debug_file: Path | None = None,
+    prefer_debug: bool = True,
+) -> Addr2lineResult:
+    """
+    Public API for symbolizer.
+
+    Parameters:
+        addr:
+            Address string for addr2line (e.g. "0x1fdb8").
+        elf_file:
+            Path to the main ELF file.
+        debug_file:
+            Path to the debug ELF file (if any).
+        prefer_debug:
+            If True and debug_file exists, use it instead of elf_file.
+
+    Returns:
+        Addr2lineResult with parsed frames. Results are cached per
+        (canonical_target, addr) pair.
+    """
+    target = elf_file
+    if prefer_debug and debug_file is not None and debug_file.is_file():
+        target = debug_file
+
+    # Normalize path so that different textual paths pointing to the same
+    # real file share the same cache entry.
+    try:
+        canonical = str(target.resolve())
+    except OSError:
+        canonical = str(target)
+
+    return _run_addr2line_cached(canonical, addr)
 
 
 __all__ = [
