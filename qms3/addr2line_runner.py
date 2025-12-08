@@ -2,14 +2,11 @@
 """
 addr2line_runner.py
 
-Module responsible for executing addr2line for QSS.
+Thin wrapper around the external 'addr2line' command.
 
 Responsibilities:
-  - Prepare command arguments for addr2line
-  - Execute addr2line for each address (supports debug ELF if available)
-  - Parse multi-line inline frame outputs
-  - Thread-based parallel execution (ProcessPool optional to add later)
-  - No stack parsing or ELF resolution is performed here
+  - Run addr2line with proper options (-f -C -i -e)
+  - Parse its output into (function, file:line) pairs
 """
 
 from __future__ import annotations
@@ -18,139 +15,98 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 
-LOG = logging.getLogger("addr2line_runner")
+LOG = logging.getLogger("addr2line")
 
-
-# ---------------------------------------------------------------------------
-# Data Model
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Addr2lineResult:
-    """
-    Represents the output of addr2line for a single address.
-
-    Inline frames appear as multiple lines:
-        funcA
-        fileA:lineA
-        funcB
-        fileB:lineB
-    """
-    address: str
     frames: List[Tuple[str, str]]  # list of (function, file:line)
-
-
-# ---------------------------------------------------------------------------
-# Helper Functions
-# ---------------------------------------------------------------------------
-
-def _run_addr2line(cmd: List[str]) -> List[str]:
-    """
-    Execute addr2line command and capture stdout lines.
-
-    Returns:
-        List[str] - raw lines (no trimming of inline structure)
-    """
-    try:
-        LOG.debug("Executing: %s", " ".join(cmd))
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-        return out.decode("utf-8", errors="replace").splitlines()
-    except subprocess.CalledProcessError as e:
-        LOG.error("addr2line failed: %s", e)
-        return ["??", "??"]
 
 
 def _pair_lines(lines: List[str]) -> List[Tuple[str, str]]:
     """
-    Given a sequence like:
-        [func1, file1:line1, func2, file2:line2]
+    Given a list like:
+        [func1, file1:line1, func2, file2:line2, ...]
     produce pairs:
-        [(func1, file1:line1), (func2, file2:line2)]
+        [(func1, file1:line1), (func2, file2:line2), ...]
     """
-    frames: List[Tuple[str, str]] = []
+    out: List[Tuple[str, str]] = []
     it = iter(lines)
     for func in it:
         try:
             file_line = next(it)
         except StopIteration:
             file_line = "??"
-        frames.append((func, file_line))
-    return frames
+        out.append((func, file_line))
+    return out
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def run_addr2line(
     addr: str,
     elf_file: Path,
-    debug_file: Optional[Path] = None,
+    debug_file: Path | None = None,
     prefer_debug: bool = True,
 ) -> Addr2lineResult:
     """
-    Execute addr2line for a single address.
+    Run addr2line for a single address.
 
     Parameters:
-        addr: Address string like "0x1234"
-        elf_file: Path to main ELF
-        debug_file: Path to debug ELF (optional)
-        prefer_debug: If True, use debug_file first when available
+        addr:
+            Address string for addr2line (e.g. "0x1fdb8").
+        elf_file:
+            Path to the main ELF file.
+        debug_file:
+            Path to the debug ELF file (if any).
+        prefer_debug:
+            If True and debug_file exists, use it instead of elf_file.
 
     Returns:
-        Addr2lineResult with parsed inline frames.
+        Addr2lineResult with parsed frames.
     """
-    target = None
-
-    if prefer_debug and debug_file and debug_file.exists():
+    target = elf_file
+    if prefer_debug and debug_file is not None and debug_file.is_file():
         target = debug_file
-    else:
-        target = elf_file
 
     cmd = [
         "addr2line",
-        "-f",  # function name
+        "-f",      # print function names
+        "-C",      # demangle C++ names
+        "-i",      # print all inlined frames
         "-e", str(target),
         addr,
     ]
 
-    raw_lines = _run_addr2line(cmd)
-    paired = _pair_lines(raw_lines)
+    LOG.debug("Running addr2line: %s", " ".join(cmd))
 
-    return Addr2lineResult(
-        address=addr,
-        frames=paired,
-    )
-
-
-def run_addr2line_batch(
-    addrs: List[str],
-    elf_file: Path,
-    debug_file: Optional[Path] = None,
-    prefer_debug: bool = True,
-) -> List[Addr2lineResult]:
-    """
-    Execute addr2line for multiple addresses sequentially.
-
-    (ThreadPool version will be provided in symbolizer layer.)
-    """
-    results: List[Addr2lineResult] = []
-    for a in addrs:
-        results.append(
-            run_addr2line(
-                addr=a,
-                elf_file=elf_file,
-                debug_file=debug_file,
-                prefer_debug=prefer_debug,
-            )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
         )
-    return results
+    except OSError as e:
+        LOG.error("Failed to execute addr2line: %s", e)
+        return Addr2lineResult(frames=[("??", "??")])
+
+    if proc.returncode != 0:
+        LOG.warning("addr2line returned non-zero exit code %d: %s",
+                    proc.returncode, proc.stderr.strip())
+        return Addr2lineResult(frames=[("??", "??")])
+
+    raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    if not raw_lines:
+        return Addr2lineResult(frames=[("??", "??")])
+
+    pairs = _pair_lines(raw_lines)
+    return Addr2lineResult(frames=pairs)
+
 
 __all__ = [
     "Addr2lineResult",
     "run_addr2line",
-    "run_addr2line_batch",
 ]

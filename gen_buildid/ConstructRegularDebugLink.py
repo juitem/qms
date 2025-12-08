@@ -6,12 +6,10 @@ Scan ELF files under the given rootfs (and target directories inside it),
 extract GNU build-id, and create build-id-based symlinks for each ELF:
 
   - For main ELFs (non-debug paths):
-      <rootfs>/usr/lib/.build-id/xx/yyyy  -> <elf_rel>
+      <rootfs>/usr/lib/.build-id/xx/yyyy  -> <relative path to ELF>
 
   - For debug ELFs (under /usr/lib/debug or *.debug):
-      <rootfs>/usr/lib/debug/.build-id/xx/yyyy.debug -> <elf_rel>
-
-Here, <elf_rel> is the rootfs-relative path of the ELF (starting with '/').
+      <rootfs>/usr/lib/debug/.build-id/xx/yyyy.debug -> <relative path to ELF>
 
 Design / policy:
 
@@ -34,6 +32,11 @@ Design / policy:
   - realpath-based:
       Each physical ELF file is processed only once per (elf_type, build-id, real_abs).
       Multiple symlink paths that resolve to the same file share the same key.
+
+  - Cross / sysroot friendly:
+      Symlink targets are stored as *relative paths* from the .build-id entry
+      to the real ELF file inside the rootfs. This makes the tree relocatable
+      without chroot.
 
 Overwrite policy:
 
@@ -334,7 +337,7 @@ def to_rootfs_rel(rootfs: str, abs_path: str) -> str:
     Convert an absolute path under rootfs to a rootfs-relative path starting with '/'.
 
     Example:
-        rootfs  = /mnt/rootfs
+        rootfs   = /mnt/rootfs
         abs_path = /mnt/rootfs/usr/lib/libfoo.so
         -> /usr/lib/libfoo.so
     """
@@ -411,7 +414,9 @@ def count_buildid_links(root: str, kind: str) -> int:
     return total
 
 
-def resolve_realpath_within_rootfs(rootfs_real: str, abs_path: str, max_symlinks: int = 40) -> str | None:
+def resolve_realpath_within_rootfs(
+    rootfs_real: str, abs_path: str, max_symlinks: int = 40
+) -> str | None:
     """
     Resolve symlinks for abs_path, interpreting absolute symlink targets
     as paths *inside* rootfs_real.
@@ -426,7 +431,6 @@ def resolve_realpath_within_rootfs(rootfs_real: str, abs_path: str, max_symlinks
         - Final resolved absolute path (host path) within rootfs_real, or
         - None if resolution escapes rootfs_real or exceeds max_symlinks.
     """
-    # Normalize starting point
     current = os.path.abspath(abs_path)
     visited: set[str] = set()
 
@@ -452,19 +456,18 @@ def resolve_realpath_within_rootfs(rootfs_real: str, abs_path: str, max_symlinks
             # Relative target: resolve relative to directory of current
             next_path = os.path.normpath(os.path.join(os.path.dirname(current), target))
 
-        # Ensure we stay within rootfs_real
         next_real = os.path.abspath(next_path)
         if not (next_real == rootfs_real or next_real.startswith(rootfs_real + os.sep)):
             return None
 
         current = next_real
 
-    # Final sanity check: must still be under rootfs_real
     current_real = os.path.abspath(current)
     if not (current_real == rootfs_real or current_real.startswith(rootfs_real + os.sep)):
         return None
 
     return current_real
+
 
 # ------------------------------------------------------------
 # Core processing
@@ -480,12 +483,12 @@ def process_elf(
 ) -> None:
     """
     Process a single ELF file:
-      - resolve realpath
+      - resolve realpath (rootfs-aware)
       - check it is inside rootfs
       - get build-id
       - deduplicate by (elf_type, build_id, real_abs)
       - choose link root (main_root or debug_root)
-      - create/overwrite/keep/skip build-id symlink
+      - create/overwrite/keep/skip build-id symlink with RELATIVE target
       - log to TSV
     """
     stats["elf_files"] += 1
@@ -501,7 +504,6 @@ def process_elf(
             print(f"[skip-outside-rootfs] {abs_path} (could not resolve within rootfs)")
         stats["realpath_outside_rootfs"] += 1
 
-        # Log the original path (relative to rootfs) so we can inspect later
         elf_rel = to_rootfs_rel(rootfs_real, abs_path)
         elf_type = classify_elf_type(elf_rel)
         log_link(
@@ -541,19 +543,20 @@ def process_elf(
     # 4) Deduplicate by (elf_type, build_id, real_abs)
     key = (elf_type, build_id, real_abs)
     if key in stats["seen_keys"]:
-        # Already processed this physical ELF for this build-id and type
         if args.verbose:
-            print(f"[duplicate-skip] {real_abs} (elf_type={elf_type}, build-id={build_id})")
+            print(
+                f"[duplicate-skip] {real_abs} "
+                f"(elf_type={elf_type}, build-id={build_id})"
+            )
         return
     stats["seen_keys"].add(key)
 
-    # 5) Choose link root and link target (the ELF itself)
+    # 5) Choose link root
     if elf_type == "debug":
         link_root = debug_root
     else:
         link_root = main_root
 
-    # If for some reason link_root is not set, skip gracefully
     if not link_root:
         if args.verbose:
             print(f"[no-link-root] {real_abs} (elf_type={elf_type}, build-id={build_id})")
@@ -570,13 +573,14 @@ def process_elf(
         )
         return
 
-    # Target for the link is always this ELF itself (rootfs-relative path)
-    link_target = elf_rel
-
     # 6) Compute build-id link path under link_root (host path)
     link_abs = make_build_id_link_path(link_root, build_id, elf_type)
     link_dir = os.path.dirname(link_abs)
     ensure_dir(link_dir)
+
+    # Target stored inside the symlink is a RELATIVE path from link_dir
+    # to the real ELF file. This is cross/sysroot-friendly.
+    link_target_rel = os.path.relpath(real_abs, link_dir)
 
     # Rootfs-relative link path for logging
     link_rel = to_rootfs_rel(rootfs_real, link_abs)
@@ -585,7 +589,6 @@ def process_elf(
     if os.path.lexists(link_abs):
         # Something already exists at link_abs
         if os.path.islink(link_abs):
-            # Existing symlink: check its current target (string)
             try:
                 current_target = os.readlink(link_abs)
             except OSError as e:
@@ -597,14 +600,14 @@ def process_elf(
                     build_id=build_id,
                     elf_type=elf_type,
                     elf_path_rel=elf_rel,
-                    debug_target_rel=link_target,
+                    debug_target_rel=elf_rel,
                     link_path_rel=link_rel,
                     log_path=log_tsv_path,
                     dry_run=args.dry_run,
                 )
                 return
 
-            if current_target == link_target:
+            if current_target == link_target_rel:
                 # Already points to the desired target -> keep it
                 if args.verbose:
                     print(
@@ -617,7 +620,7 @@ def process_elf(
                     build_id=build_id,
                     elf_type=elf_type,
                     elf_path_rel=elf_rel,
-                    debug_target_rel=link_target,
+                    debug_target_rel=elf_rel,
                     link_path_rel=link_rel,
                     log_path=log_tsv_path,
                     dry_run=args.dry_run,
@@ -626,39 +629,37 @@ def process_elf(
 
             # Symlink exists but points to a different target
             if args.overwrite:
-                # Compare file sizes of current_target vs. new link_target.
-                # Idea:
-                #   - If new candidate is larger -> overwrite (more debug info likely).
-                #   - If existing target is larger or equal -> keep existing link.
+                # Compare file sizes of current_target vs. this ELF (real_abs).
+                # If new candidate is larger -> overwrite.
                 current_size = -1
                 new_size = -1
 
-                # Both targets are stored as rootfs-relative paths (e.g. /usr/lib/... or /usr/lib/debug/...)
-                # Try to resolve them to real files under rootfs for size comparison.
-                if current_target.startswith("/"):
-                    current_abs = os.path.join(rootfs_real, current_target.lstrip("/"))
-                    if os.path.exists(current_abs):
+                current_abs: str | None = None
+                if current_target:
+                    if current_target.startswith("/"):
+                        cand = os.path.join(rootfs_real, current_target.lstrip("/"))
+                    else:
+                        cand = os.path.normpath(
+                            os.path.join(os.path.dirname(link_abs), current_target)
+                        )
+                    if os.path.exists(cand):
+                        current_abs = cand
                         try:
                             current_size = os.path.getsize(current_abs)
                         except OSError:
                             current_size = -1
 
-                if link_target.startswith("/"):
-                    new_abs = os.path.join(rootfs_real, link_target.lstrip("/"))
-                    if os.path.exists(new_abs):
-                        try:
-                            new_size = os.path.getsize(new_abs)
-                        except OSError:
-                            new_size = -1
+                new_abs: str | None = None
+                if os.path.exists(real_abs):
+                    new_abs = real_abs
+                    try:
+                        new_size = os.path.getsize(new_abs)
+                    except OSError:
+                        new_size = -1
 
                 # Decide whether to overwrite based on size.
-                # - If we cannot get sizes for either, fall back to always overwriting.
-                # - If new_size > current_size -> overwrite.
-                # - If new_size <= current_size and current_size >= 0 -> keep existing.
                 do_overwrite = False
-
                 if new_size < 0 and current_size < 0:
-                    # No reliable size info; keep previous behavior (always overwrite).
                     do_overwrite = True
                 elif new_size > current_size:
                     do_overwrite = True
@@ -668,7 +669,7 @@ def process_elf(
                 if do_overwrite:
                     if args.verbose:
                         print(
-                            f"[overwrite] {link_abs} : {current_target} -> {link_target} "
+                            f"[overwrite] {link_abs} : {current_target} -> {link_target_rel} "
                             f"(from {elf_rel}, build-id={build_id}, "
                             f"current_size={current_size}, new_size={new_size}, "
                             f"elf_type={elf_type})"
@@ -676,7 +677,7 @@ def process_elf(
                     if not args.dry_run:
                         try:
                             os.remove(link_abs)
-                            os.symlink(link_target, link_abs)
+                            os.symlink(link_target_rel, link_abs)
                         except OSError as e:
                             sys.stderr.write(
                                 f"ERROR: failed to overwrite symlink {link_abs}: {e}\n"
@@ -688,18 +689,17 @@ def process_elf(
                         build_id=build_id,
                         elf_type=elf_type,
                         elf_path_rel=elf_rel,
-                        debug_target_rel=link_target,
+                        debug_target_rel=elf_rel,
                         link_path_rel=link_rel,
                         log_path=log_tsv_path,
                         dry_run=args.dry_run,
                     )
                 else:
-                    # Existing target is larger or equal; keep it.
                     if args.verbose:
                         print(
                             f"[keep-larger] {link_abs} (symlink, "
                             f"current={current_target} size={current_size}, "
-                            f"candidate={link_target} size={new_size}, "
+                            f"candidate={link_target_rel} size={new_size}, "
                             f"build-id={build_id}, elf_type={elf_type})"
                         )
                     stats["links_existing_skipped"] += 1
@@ -708,17 +708,17 @@ def process_elf(
                         build_id=build_id,
                         elf_type=elf_type,
                         elf_path_rel=elf_rel,
-                        debug_target_rel=link_target,
+                        debug_target_rel=elf_rel,
                         link_path_rel=link_rel,
                         log_path=log_tsv_path,
                         dry_run=args.dry_run,
                     )
             else:
-                # Overwrite not allowed, keep existing
                 if args.verbose:
                     print(
                         f"[exists-skip] {link_abs} (symlink, target={current_target}, "
-                        f"desired={link_target}, build-id={build_id}, elf_type={elf_type})"
+                        f"desired={link_target_rel}, build-id={build_id}, "
+                        f"elf_type={elf_type})"
                     )
                 stats["links_existing_skipped"] += 1
                 log_link(
@@ -726,7 +726,7 @@ def process_elf(
                     build_id=build_id,
                     elf_type=elf_type,
                     elf_path_rel=elf_rel,
-                    debug_target_rel=link_target,
+                    debug_target_rel=elf_rel,
                     link_path_rel=link_rel,
                     log_path=log_tsv_path,
                     dry_run=args.dry_run,
@@ -736,7 +736,8 @@ def process_elf(
         # Not a symlink: regular file or directory – do not touch
         if args.verbose:
             print(
-                f"[exists-skip] {link_abs} (non-symlink, preserved, build-id={build_id}, elf_type={elf_type})"
+                f"[exists-skip] {link_abs} (non-symlink, preserved, "
+                f"build-id={build_id}, elf_type={elf_type})"
             )
         stats["links_existing_skipped"] += 1
         log_link(
@@ -744,7 +745,7 @@ def process_elf(
             build_id=build_id,
             elf_type=elf_type,
             elf_path_rel=elf_rel,
-            debug_target_rel=link_target,
+            debug_target_rel=elf_rel,
             link_path_rel=link_rel,
             log_path=log_tsv_path,
             dry_run=args.dry_run,
@@ -754,12 +755,12 @@ def process_elf(
     # 8) No existing link/file: create new build-id symlink
     if args.verbose:
         print(
-            f"[create] {link_abs} -> {link_target} "
+            f"[create] {link_abs} -> {link_target_rel} "
             f"(from {elf_rel}, build-id={build_id}, elf_type={elf_type})"
         )
     if not args.dry_run:
         try:
-            os.symlink(link_target, link_abs)
+            os.symlink(link_target_rel, link_abs)
         except OSError as e:
             sys.stderr.write(f"ERROR: failed to create symlink {link_abs}: {e}\n")
             return
@@ -770,7 +771,7 @@ def process_elf(
         build_id=build_id,
         elf_type=elf_type,
         elf_path_rel=elf_rel,
-        debug_target_rel=link_target,
+        debug_target_rel=elf_rel,
         link_path_rel=link_rel,
         log_path=log_tsv_path,
         dry_run=args.dry_run,
@@ -809,7 +810,6 @@ def main() -> None:
         if tgt.upper() == "ALL":
             scan_roots = [rootfs_real]
             break
-        # Treat tgt as path inside rootfs
         if tgt.startswith("/"):
             rel = tgt.lstrip("/")
         else:
@@ -832,7 +832,7 @@ def main() -> None:
         print(f"debug_root      : {debug_root}")
         print(f"tsv_log         : {tsv_log_path}")
         print(f"buildid_backend : {args.buildid_backend}")
-        print(f"scan_roots      :")
+        print("scan_roots      :")
         for sr in scan_roots:
             print(f"  - {sr}")
         print(f"overwrite       : {args.overwrite}")
@@ -859,7 +859,6 @@ def main() -> None:
                 full_path = os.path.join(dirpath, fname)
                 stats["scanned_files"] += 1
 
-                # process regular files or symlinks that look like ELF
                 if not os.path.isfile(full_path) and not os.path.islink(full_path):
                     continue
                 if not is_elf(full_path):
@@ -875,7 +874,6 @@ def main() -> None:
                     tsv_log_path,
                 )
 
-    # Summary
     print("=== ConstructRegularDebugLink summary ===")
     print(f"rootfs                  : {rootfs_real}")
     print(f"main_root (main)        : {main_root}")
@@ -889,10 +887,8 @@ def main() -> None:
     print(f"build-id links overwritten: {stats['links_overwritten']}")
     print(f"build-id links skipped  : {stats['links_existing_skipped']}")
 
-    # Count existing debug build-id links (.debug) under debug_root
     debug_links_existing = count_buildid_links(debug_root, kind="debug")
 
-    # Count main build-id links under main_root
     main_links_existing = 0
     if os.path.isdir(main_root):
         main_links_existing = count_buildid_links(main_root, kind="main")

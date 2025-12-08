@@ -2,17 +2,14 @@
 """
 resolver.py
 
-ELF + Build-id resolver for QSS.
+Responsible for resolving ELF and debug file paths based on:
+  - rootfs path
+  - debug_root path (typically /usr/lib/debug/.build-id)
+  - logged ELF path (e.g. /hal/lib64/libfoo.so)
+  - optional build-id
 
-Responsibilities:
-  - Given (elf_path, build_id), locate:
-        * real ELF file inside rootfs
-        * corresponding debug ELF file inside debug-root
-  - Handle symbolic links
-  - Provide a clean API for qss.py to obtain resolved paths
-  - No addr2line execution here
-
-This module does NOT parse stack dumps.
+The goal is to return:
+  (real_elf_path, debug_elf_path or None)
 """
 
 from __future__ import annotations
@@ -25,71 +22,49 @@ from typing import Optional, Tuple
 LOG = logging.getLogger("resolver")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _resolve_elf(rootfs: Path, elf_path: str) -> Optional[Path]:
+    """
+    Resolve the ELF inside the rootfs.
 
-def _try_path(p: Path) -> Optional[Path]:
-    """Return p if it exists, otherwise None."""
-    if p.exists():
+    Example:
+        rootfs = /mnt/rootfs
+        elf_path = /hal/lib64/libfoo.so
+        -> /mnt/rootfs/hal/lib64/libfoo.so
+    """
+    elf = rootfs / elf_path.lstrip("/")
+    if elf.is_file():
+        return elf
+    # Fallback: try as-is (host path)
+    p = Path(elf_path)
+    if p.is_file():
         return p
+    LOG.warning("ELF file not found: %s (rootfs: %s)", elf_path, rootfs)
     return None
 
 
-def _resolve_build_id_path(debug_root: Path, build_id: str) -> Optional[Path]:
+def _resolve_debug_by_buildid(debug_root: Path, build_id: str) -> Optional[Path]:
     """
-    Given debug-root = /usr/lib/debug/.build-id
-    and build_id = 'aa0d6e0...', locate:
+    Resolve debug file by BuildId under debug_root.
 
-        /usr/lib/debug/.build-id/aa/0d6e0....debug
-
-    build-id hex: first 2 chars = directory, remaining = filename.
-    """
-    if len(build_id) < 3:
-        return None
-
-    prefix = build_id[:2]
-    suffix = build_id[2:]
-    candidate = debug_root / prefix / (suffix + ".debug")
-
-    return candidate if candidate.exists() else None
-
-
-# ---------------------------------------------------------------------------
-# Public Resolver API
-# ---------------------------------------------------------------------------
-
-def resolve_elf(
-    rootfs: Path,
-    elf_path: str
-) -> Optional[Path]:
-    """
-    Resolve an ELF path relative to rootfs.
-
-    Input elf_path examples:
-        /usr/lib64/libfoo.so
-        /usr/share/app/.../bin/app1
-
-    If rootfs = /mnt/rootfs:
-        return /mnt/rootfs/usr/lib64/libfoo.so  (if exists)
-    """
-    p = rootfs / elf_path.lstrip("/")
-    return p if p.exists() else None
-
-
-def resolve_debug_file(
-    debug_root: Path,
-    build_id: Optional[str]
-) -> Optional[Path]:
-    """
-    Resolve a debug file from build-id.
-
-    If build-id is None: cannot resolve → return None.
+    Typical layout:
+        debug_root / "aa" / "0d6e0...debug"
+    where build_id == "aa0d6e0..."
     """
     if not build_id:
         return None
 
-    return _resolve_build_id_path(debug_root, build_id)
+    bid = build_id.strip()
+    if len(bid) < 3:
+        return None
+
+    subdir = bid[:2]
+    rest = bid[2:]
+    candidate = debug_root / subdir / (rest + ".debug")
+    if candidate.is_file():
+        return candidate
+
+    LOG.debug("Debug file not found for BuildId %s under %s", build_id, debug_root)
+    return None
 
 
 def resolve_pair(
@@ -99,20 +74,23 @@ def resolve_pair(
     build_id: Optional[str],
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """
-    Resolve both actual ELF and debug-ELF.
+    Resolve ELF and debug file paths.
 
-    Return:
-        (resolved_elf, resolved_debug_elf)
+    Returns:
+        (real_elf, debug_elf or None)
     """
-    real_elf = resolve_elf(rootfs, elf_path)
-    debug_elf = resolve_debug_file(debug_root, build_id)
+    real_elf = _resolve_elf(rootfs, elf_path)
+    debug_elf: Optional[Path] = None
 
-    LOG.debug("Resolved pair: %s → ELF:%s DEBUG:%s", elf_path, real_elf, debug_elf)
+    if build_id:
+        debug_elf = _resolve_debug_by_buildid(debug_root, build_id)
+
+    # Fallback: if debug_root is not .build-id style, you could add more rules here,
+    # for example /usr/lib/debug/<path>.debug, but we keep it simple for now.
+
     return real_elf, debug_elf
 
 
 __all__ = [
-    "resolve_elf",
-    "resolve_debug_file",
     "resolve_pair",
 ]

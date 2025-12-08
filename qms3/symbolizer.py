@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 """
 symbolizer.py
@@ -22,7 +20,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from parser import Frame, StackTrace
 from resolver import resolve_pair
@@ -43,12 +41,20 @@ class SymbolizedFrame:
 
     The original stack dump address is preserved.
     Inline frames can exist as a list.
+
+    Additional fields (obj_path, obj_offset, build_id) are kept so that
+    output formatters can reconstruct helpful hints like:
+        (/usr/lib64/libc.so.6+0xdca48) (BuildId: abc123...)
+    even when symbolization fails (e.g. "??").
     """
     trace_index: int
     frame_index: int
     address: str
     inlines: List[Tuple[str, str]]  # list of (function, file:line)
     raw_line: str
+    obj_path: Optional[str] = None
+    obj_offset: Optional[str] = None
+    build_id: Optional[str] = None
 
 
 @dataclass
@@ -73,8 +79,25 @@ def _symbolize_frame(
     """
     Symbolize a single frame:
       - resolve ELF + debug paths
+      - choose proper address for addr2line (object offset if available)
       - run addr2line
     """
+
+    # Case 1: This frame is already decoded (raw-only, no ELF info).
+    # We keep the original line and do not run addr2line.
+    if not frame.obj_path and not frame.build_id and not frame.obj_offset:
+        return SymbolizedFrame(
+            trace_index=frame.trace_index,
+            frame_index=frame.frame_index,
+            address=frame.address,
+            inlines=[],  # no symbolization info
+            raw_line=frame.raw_line,
+            obj_path=None,
+            obj_offset=None,
+            build_id=None,
+        )
+
+    # Case 2: ELF exists → try symbolization
     if frame.obj_path:
         real_elf, debug_elf = resolve_pair(
             rootfs=rootfs,
@@ -93,10 +116,19 @@ def _symbolize_frame(
             address=frame.address,
             inlines=[("??", "??")],
             raw_line=frame.raw_line,
+            obj_path=frame.obj_path,
+            obj_offset=frame.obj_offset,
+            build_id=frame.build_id,
         )
 
+    # Prefer object-relative offset if available; fall back to raw address.
+    # For lines like:
+    #   #1 0x1ffff9de0d58 (/usr/lib64/libfoo.so+0x1fdb8) (BuildId:...)
+    # addr2line should normally receive "0x1fdb8", not the process address.
+    addr_for_lookup = frame.obj_offset if frame.obj_offset else frame.address
+
     result: Addr2lineResult = run_addr2line(
-        addr=frame.address,
+        addr=addr_for_lookup,
         elf_file=real_elf,
         debug_file=debug_elf,
         prefer_debug=True,
@@ -108,6 +140,9 @@ def _symbolize_frame(
         address=frame.address,
         inlines=result.frames,
         raw_line=frame.raw_line,
+        obj_path=frame.obj_path,
+        obj_offset=frame.obj_offset,
+        build_id=frame.build_id,
     )
 
 
