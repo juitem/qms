@@ -2,215 +2,244 @@
 """
 parser.py
 
-Stack dump parser for QSS.
+Stack log parser for QSS.
 
 Responsibilities:
-  - Parse raw log files that contain one or more stack traces.
-  - Detect stack frames of the form:
-        "#N 0xADDR (/path/lib.so+0xOFF) (BuildId:ABCD...)"
-    and also already-decoded frames like:
-        "#N 0xADDR in func file.c:10"
-  - Produce structured StackTrace / Frame objects for symbolization.
+  - Parse raw stack log files into structured StackTrace / StackFrame objects.
+  - Extract:
+      * frame index (#N)
+      * address (0x...)
+      * ELF path + offset from "(/path/lib.so+0xOFF)" part
+      * BuildId from "(BuildId: XXXXX...)" if present
+      * raw_line (original text of the frame line)
+  - Split a file into multiple traces when "#0 ..." appears again.
+
+Notes:
+  - Non-frame lines are kept as 'preamble' before the first frame of each
+    trace. Those preambles can be re-attached when formatting / merging.
+  - We deliberately do NOT try to parse function name or "file:line" from
+    the raw line here. That is handled by addr2line + symbolizer.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple, Iterable, Set
-
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Frame:
-    trace_index: int
-    frame_index: int          # as found in the stack ("#N")
-    address: str              # e.g. "0x0000fffff000abcd"
-    obj_path: Optional[str]   # ELF path in the log, e.g. "/hal/lib64/libfoo.so"
-    obj_offset: Optional[str] # e.g. "0x1fdb8"
-    build_id: Optional[str]   # e.g. "aa0d6e0..."
-    raw_line: str             # the original line from the log
-
-
-@dataclass
-class StackTrace:
-    trace_index: int
-    frames: List[Frame]
-    preamble: List[str]
+from typing import Iterable, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
 # Regexes
 # ---------------------------------------------------------------------------
 
-# Generic frame prefix: "#<n> 0xADDR ..."
-FRAME_PREFIX_RE = re.compile(
-    r"^\s*#(?P<idx>\d+)\s+(?P<addr>0x[0-9a-fA-F]+)\s+(?P<rest>.*)$"
-)
-
-# Path + offset + optional BuildId in a parenthesis block:
-#   (/path/lib.so+0xOFFSET) (BuildId:abcdef...)
+# Example tail:
+#   (/usr/lib64/libc.so.6+0xdca48) (BuildId: 12345abced...)
+#
+# BuildId part is optional; when absent, we still capture path + offset.
 PATH_OFFSET_BUILDID_RE = re.compile(
     r"\((?P<path>/[^+]+)\+(?P<offset>0x[0-9a-fA-F]+)\)\s*"
-    r"(?:\(BuildId:(?P<buildid>[0-9A-Fa-f]+)\))?"
+    r"(?:\(BuildId: (?P<buildid>[0-9A-Fa-f]+)\))?"
 )
+
+# Frame line:
+#   "#3 0x1ffff9de0d58 (/usr/lib64/libfoo.so+0x1234) (BuildId: ...)"
+#   "#10 0xaaaa6a36594 in _utc_decode_from_file src/utc-image.c:167"
+FRAME_LINE_RE = re.compile(
+    r"""
+    ^\s*
+    \#(?P<index>\d+)          # '#<index>'
+    \s+
+    (?P<addr>0x[0-9a-fA-F]+)  # '0x...'
+    (?P<rest>.*)              # the rest of the line
+    $
+    """,
+    re.VERBOSE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StackFrame:
+    """
+    Single raw stack frame as parsed from the log.
+
+    Fields:
+        raw_line:  Original line text (without trailing newline).
+        index:     Frame index parsed from '#<index>'.
+        address:   Address string (e.g. '0x1ffff9de0d58').
+        obj_path:  ELF path from '(/path/lib.so+0xOFF)', if present.
+        obj_offset:Offset from the same parenthesis, e.g. '0x1234', if present.
+        build_id:  BuildId from '(BuildId: XXXXX...)', if present; else None.
+    """
+    raw_line: str
+    index: int
+    address: str
+    obj_path: Optional[str] = None
+    obj_offset: Optional[str] = None
+    build_id: Optional[str] = None
+Frame=StackFrame
+
+
+@dataclass
+class StackTrace:
+    """
+    Collection of frames representing a single logical stack trace.
+
+    Fields:
+        preamble:
+            Lines that appear before the first frame of this trace in the log.
+            These are preserved so that we can re-attach them when formatting.
+        frames:
+            List of StackFrame objects for this trace.
+    """
+    preamble: List[str] = field(default_factory=list)
+    frames: List[StackFrame] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def _parse_frame_line(
-    raw_line: str,
-    trace_index: int,
-) -> Optional[Frame]:
+def _parse_frame_line(line: str) -> Optional[StackFrame]:
     """
-    Try to parse a single stack frame line.
+    Try to parse a single line as a stack frame.
 
     Returns:
-        Frame if the line looks like a stack frame, otherwise None.
+        StackFrame if the line matches a '#<n> 0x...' pattern; otherwise None.
     """
-    m = FRAME_PREFIX_RE.match(raw_line)
+    m = FRAME_LINE_RE.match(line)
     if not m:
         return None
 
-    idx_str = m.group("idx")
+    idx_str = m.group("index")
     addr = m.group("addr")
-    rest = m.group("rest")
+    rest = m.group("rest") or ""
 
     try:
-        frame_idx = int(idx_str)
+        index = int(idx_str)
     except ValueError:
-        frame_idx = 0
+        # Should not happen if regex is correct.
+        return None
 
-    # Try to find "(/path/lib.so+0xOFF) (BuildId:...)" pattern in the rest
     obj_path: Optional[str] = None
     obj_offset: Optional[str] = None
     build_id: Optional[str] = None
 
+    # Look for "(/path/lib.so+0xOFF) (BuildId: XXXX...)" pattern in the tail.
     m2 = PATH_OFFSET_BUILDID_RE.search(rest)
     if m2:
         obj_path = m2.group("path")
         obj_offset = m2.group("offset")
         build_id = m2.group("buildid")
 
-    return Frame(
-        trace_index=trace_index,
-        frame_index=frame_idx,
+    return StackFrame(
+        raw_line=line.rstrip("\n"),
+        index=index,
         address=addr,
         obj_path=obj_path,
         obj_offset=obj_offset,
         build_id=build_id,
-        raw_line=raw_line.rstrip("\n"),
     )
 
 
-def parse_stack_lines(lines: Iterable[str]) -> List[StackTrace]:
-    """
-    Parse an iterable of lines into a list of StackTrace objects.
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-    Heuristic:
-      - A new trace starts when we see a frame with index 0 ("#0 ...")
-        or when we see the first frame after non-frame lines.
-      - Frames after that belong to the same trace until we either:
-          * encounter another "#0 ..." frame (new trace), or
-          * reach the end of input.
-      - We do not attempt to parse "preamble" lines; they are collected
-        but not deeply analyzed.
+def parse_stack_file(path: Path) -> List[StackTrace]:
+    """
+    Parse a stack log file into a list of StackTrace objects.
+
+    Splitting rules:
+      - We scan the file line by line.
+      - When we encounter a frame line with '#0 ...' and we already have
+        frames collected for the current trace, we:
+          * close the current trace,
+          * start a new trace and treat any accumulated non-frame lines
+            as its preamble.
+      - Lines that are not frame lines and appear before the first frame
+        of a trace are stored as preamble for that trace.
+      - Lines that are not frame lines and appear after we started collecting
+        frames are ignored here; they are expected to be preserved by the
+        outer merge logic, which edits the original file rather than only
+        using these traces.
     """
     traces: List[StackTrace] = []
-    current_frames: List[Frame] = []
     current_preamble: List[str] = []
-    current_trace_index = -1
-    inside_trace = False
+    current_frames: List[StackFrame] = []
 
-    for raw in lines:
-        line = raw.rstrip("\n")
-        frame = _parse_frame_line(line, trace_index=current_trace_index + 1)
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            # Keep the original line string (with trailing newline)
+            stripped_line = line.rstrip("\n")
 
-        if frame is None:
-            # Not a frame line
-            if inside_trace:
-                # Still part of the current trace's preamble/footer.
-                current_preamble.append(line)
-            else:
-                # Outside any trace; standalone text.
-                current_preamble.append(line)
-            continue
+            frame = _parse_frame_line(stripped_line)
+            if frame is None:
+                # Non-frame line
+                if not current_frames:
+                    # This belongs to the preamble of the next trace.
+                    current_preamble.append(stripped_line)
+                else:
+                    # We are in the middle of frames; for now we ignore
+                    # such lines here. The merge step works on the original
+                    # file and will preserve them there.
+                    pass
+                continue
 
-        # We have a frame line
-        if not inside_trace or frame.frame_index == 0:
-            # Close previous trace if any
-            if inside_trace and current_frames:
+            # We have a frame line.
+            if frame.index == 0 and current_frames:
+                # Start of a new trace: close the previous one.
                 traces.append(
                     StackTrace(
-                        trace_index=current_trace_index,
-                        frames=current_frames,
                         preamble=current_preamble,
+                        frames=current_frames,
                     )
                 )
-                current_frames = []
                 current_preamble = []
+                current_frames = []
 
-            # Start new trace
-            current_trace_index += 1
-            inside_trace = True
-            frame.trace_index = current_trace_index
+            current_frames.append(frame)
 
-        else:
-            # Continuation of the same trace
-            frame.trace_index = current_trace_index
-
-        current_frames.append(frame)
-
-    # Close last trace
-    if inside_trace and current_frames:
+    # Flush the last trace if any frames were collected.
+    if current_frames:
         traces.append(
             StackTrace(
-                trace_index=current_trace_index,
-                frames=current_frames,
                 preamble=current_preamble,
+                frames=current_frames,
             )
         )
 
     return traces
 
 
-def parse_stack_file(path: Path, encoding: str = "utf-8") -> List[StackTrace]:
+def collect_unique_elf_build_ids(
+    traces: Iterable[StackTrace],
+) -> Set[Tuple[str, Optional[str]]]:
     """
-    Read a stack file and parse it into StackTrace objects.
-    """
-    with path.open("r", encoding=encoding, errors="replace") as f:
-        lines = f.readlines()
-    return parse_stack_lines(lines)
+    Collect unique (ELF path, BuildId) pairs from all traces.
 
-
-def collect_unique_elf_build_ids(traces: Iterable[StackTrace]) -> List[Tuple[str, Optional[str]]]:
+    Used by '--summary' to print a list like:
+        /usr/lib64/libfoo.so    BuildId:abcd1234...
+        /usr/lib64/libbar.so    BuildId:None
     """
-    Collect unique (obj_path, build_id) pairs from a list of StackTrace objects.
-
-    Returns:
-        List of (obj_path, build_id) pairs.
-    """
-    seen: Set[Tuple[str, Optional[str]]] = set()
+    pairs: Set[Tuple[str, Optional[str]]] = set()
 
     for trace in traces:
         for frame in trace.frames:
             if frame.obj_path:
-                key = (frame.obj_path, frame.build_id)
-                seen.add(key)
+                pairs.add((frame.obj_path, frame.build_id))
 
-    return list(seen)
+    return pairs
 
 
 __all__ = [
-    "Frame",
+    "StackFrame",
+    "Frame"
     "StackTrace",
     "parse_stack_file",
-    "parse_stack_lines",
     "collect_unique_elf_build_ids",
 ]

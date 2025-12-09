@@ -2,25 +2,34 @@
 """
 merge_original.py
 
-Utilities to merge symbolized stack traces back into the original log file.
+Merge symbolized stack traces back into the original log file.
 
-High-level idea:
-  - Keep all non-stack lines from the original log as-is.
-  - For each stack trace that has been symbolized (SymbolizedTrace),
-    find the corresponding block of raw stack frames in the original file
-    and replace that block with the formatted symbolized trace.
+High-level behavior:
 
-Assumptions:
-  - Each SymbolizedTrace.frames[i].raw_line exactly matches a line in the
-    original log file (before symbolization).
-  - For a given trace, all frames appear as a contiguous block of lines in
-    the original log (typical for stack dumps).
-  - We only replace known stack blocks; everything else in the original file
-    is preserved as-is.
+  - Read the original log file as plain text lines.
+  - For each SymbolizedTrace (in order), find the first frame's raw_line
+    in the original file.
+  - Copy all lines before that point as-is.
+  - Replace the consecutive original frame lines with the formatted
+    symbolized trace (stack only, no preamble).
+  - Continue scanning forward; repeat for the next trace.
+  - Copy any remaining lines at the end as-is.
+
+Important assumptions:
+
+  - Traces in `sym_traces` correspond to stack dumps in the original file
+    in the same order as they were parsed.
+  - For each SymbolizedTrace:
+      - frames[i].raw_line is exactly one original line in the log
+      - frames are contiguous in the original log (no unrelated lines in between)
+  - Inline frames do NOT correspond to extra lines in the original log;
+    they only affect how a single original frame line expands into multiple
+    output lines.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterable, List
 
@@ -28,117 +37,120 @@ from symbolizer import SymbolizedTrace
 from output_formatter import format_symbolized_trace
 
 
-def _strip_newline(line: str) -> str:
-    """Return the line without a trailing newline."""
-    if line.endswith("\n") or line.endswith("\r"):
-        return line.rstrip("\r\n")
-    return line
+LOG = logging.getLogger("merge_original")
 
 
-def merge_original_lines(
-    original_lines: List[str],
-    traces: Iterable[SymbolizedTrace],
-) -> List[str]:
+def _normalize_line(s: str) -> str:
     """
-    Merge symbolized traces into the original log lines.
+    Normalize a log line for comparison.
 
-    Parameters:
-        original_lines:
-            List of lines read from the original log file, INCLUDING newlines.
-        traces:
-            Iterable of SymbolizedTrace objects produced by the symbolizer.
-
-    Returns:
-        New list of lines, INCLUDING newlines, where stack blocks have been
-        replaced by formatted symbolized traces, and all other lines are
-        preserved as-is.
+    We strip only the trailing newline so that raw_line (without '\n')
+    matches the line read from the file.
     """
-    # Work on a copy so we do not mutate the caller's list
-    src_lines = list(original_lines)
-    out_lines: List[str] = []
-
-    # Flatten traces into a list
-    traces_list = list(traces)
-    if not traces_list:
-        # Nothing to merge; return original as-is
-        return src_lines
-
-    idx = 0
-    n = len(src_lines)
-
-    # Iterate through each trace and replace its block in order
-    for trace in traces_list:
-        if not trace.frames:
-            # No frames, nothing to replace for this trace
-            continue
-
-        # The raw line of the first frame in this trace (without newline).
-        first_raw = _strip_newline(trace.frames[0].raw_line)
-
-        # 1) Copy original lines until we find the first frame's raw line
-        start_idx = -1
-        while idx < n:
-            current_raw = _strip_newline(src_lines[idx])
-            if current_raw == first_raw:
-                start_idx = idx
-                break
-            # Not a match; keep the original line
-            out_lines.append(src_lines[idx])
-            idx += 1
-
-        if start_idx < 0:
-            # Could not find this trace in the remaining original lines.
-            # Stop merging further traces; append the rest as-is.
-            out_lines.extend(src_lines[idx:])
-            return out_lines
-
-        # 2) We found the start of this trace's stack block at start_idx.
-        #    Skip the original stack block lines corresponding to the
-        #    number of frames in this trace.
-        block_len = len(trace.frames)
-        end_idx = min(start_idx + block_len, n)
-
-        # Skip original block [start_idx:end_idx]
-        idx = end_idx
-
-        # 3) Append the formatted symbolized trace (without preamble,
-        #    because preamble lines, if any, are usually already present
-        #    in the original log around the stack block).
-        formatted = format_symbolized_trace(trace, include_preamble=False)
-
-        for line in formatted:
-            # format_symbolized_trace returns lines WITHOUT newlines
-            out_lines.append(line + "\n")
-
-    # 4) After replacing all trace blocks, append remaining original lines
-    if idx < n:
-        out_lines.extend(src_lines[idx:])
-
-    return out_lines
+    return s.rstrip("\n\r")
 
 
 def merge_original_file(
-    original_path: Path,
-    traces: Iterable[SymbolizedTrace],
-    output_path: Path,
+    src_path: Path,
+    sym_traces: Iterable[SymbolizedTrace],
+    dst_path: Path,
     encoding: str = "utf-8",
 ) -> None:
     """
-    Convenience helper:
-      - Read original file
-      - Merge symbolized traces
-      - Write merged result to output file
+    Merge symbolized traces into the original log file.
+
+    Parameters:
+        src_path:
+            Path to the original log file.
+        sym_traces:
+            Iterable of SymbolizedTrace objects produced by symbolize_all().
+        dst_path:
+            Path to write the merged log file.
     """
-    with original_path.open("r", encoding=encoding, errors="replace") as f:
-        original_lines = f.readlines()
+    LOG.info("Merging original log: %s -> %s", src_path, dst_path)
 
-    merged_lines = merge_original_lines(original_lines, traces)
+    # Read the entire original file.
+    with src_path.open("r", encoding=encoding, errors="replace") as f:
+        original_lines: List[str] = f.readlines()
 
-    with output_path.open("w", encoding=encoding) as f:
-        f.writelines(merged_lines)
+    out_lines: List[str] = []
+    i = 0
+    n = len(original_lines)
+
+    # Process each symbolized trace in order.
+    for trace in sym_traces:
+        if not trace.frames:
+            continue
+
+        # We rely on the first frame's raw_line as an anchor in the original log.
+        first_raw = _normalize_line(trace.frames[0].raw_line or "")
+
+        if not first_raw:
+            # If raw_line is somehow empty, we cannot match it safely; skip this trace.
+            LOG.warning(
+                "Trace %d has empty first raw_line; skipping merge for this trace.",
+                trace.trace_index,
+            )
+            continue
+
+        # Scan forward until we find the anchor line.
+        found_index = -1
+        while i < n:
+            line_norm = _normalize_line(original_lines[i])
+            if line_norm == first_raw:
+                found_index = i
+                break
+            out_lines.append(original_lines[i])
+            i += 1
+
+        if found_index < 0:
+            # Could not find this trace in the remaining lines.
+            LOG.warning(
+                "Could not find first frame of trace %d in original log; "
+                "copying remaining lines as-is.",
+                trace.trace_index,
+            )
+            # Copy the rest and stop processing further traces.
+            out_lines.extend(original_lines[i:])
+            i = n
+            break
+
+        # We found the start of this trace at found_index.
+        start = found_index
+
+        # Skip original frame lines corresponding to this trace.
+        # Assumption: one frame -> one original line.
+        frame_count = len(trace.frames)
+        end = min(n, start + frame_count)
+        i = end  # move cursor past the original frame block
+
+        # Now insert the symbolized version of this trace.
+        # We do NOT include preamble here, because preamble lines are already
+        # present in the original file before 'start' and have been copied above.
+        formatted = format_symbolized_trace(trace, include_preamble=False)
+
+        for idx, line in enumerate(formatted):
+            # format_symbolized_trace() returns lines WITHOUT trailing '\n'.
+            # We always end lines with a single '\n' when writing back.
+            if line == "" and idx == len(formatted) - 1:
+                # Last blank separator line at the end of the trace:
+                # keep it as a single newline (no extra blank block).
+                out_lines.append("\n")
+            else:
+                out_lines.append(line + "\n")
+
+    # Copy any remaining original lines after the last merged trace.
+    if i < n:
+        out_lines.extend(original_lines[i:])
+
+    # Write the merged result.
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    with dst_path.open("w", encoding=encoding) as f:
+        f.writelines(out_lines)
+
+    LOG.info("Merged log written to: %s", dst_path)
 
 
 __all__ = [
-    "merge_original_lines",
     "merge_original_file",
 ]
